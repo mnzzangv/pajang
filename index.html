@@ -111,7 +111,7 @@
         </div>
 
         <!-- 뷰 1: 보유 게임 & 순환 대여 -->
-        <section id="view-inventory" class="space-y-6">
+        <section id="view-inventory" class="hidden space-y-6">
             <!-- 요약 통계 카드 -->
             <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
                 <div class="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm">
@@ -435,7 +435,7 @@
                 <button id="close-db-config-btn" type="button" class="text-slate-400 hover:text-slate-600 text-xl font-bold">✕</button>
             </div>
             <p class="text-xs text-slate-500 mb-4 leading-relaxed">
-                구글 사이트 등 외부 페이지에서도 여러 선생님이 같은 데이터를 실시간으로 공유하려면 공유 그룹 ID와 Firebase 웹 설정(JSON)을 입력해 주세요. 입력하지 않아도 현재 브라우저에 저장됩니다.
+                구글 사이트 또는 GitHub 페이지에서도 여러 선생님이 같은 데이터를 실시간으로 공유하려면 공유 그룹 ID와 Firebase 웹 설정(JSON)을 입력해 주세요. 입력하지 않아도 현재 브라우저에 모든 게임과 수업 기록이 저장됩니다.
             </p>
             <form id="db-config-form" class="space-y-4">
                 <div>
@@ -470,1374 +470,1263 @@
     </div>
 
     <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { initializeApp, deleteApp, getApps } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, doc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, addDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // ==========================================
-        // 1. 저장소 및 환경 설정 헬퍼
+        // 1. 전역 상태 및 저장소 유틸리티
         // ==========================================
-        const STORAGE_KEY_CONFIG = 'neulbom_boardgame_fb_config_v1';
-        const STORAGE_KEY_GROUP = 'neulbom_boardgame_group_id_v1';
-        const LOCAL_DATA_PREFIX = 'neulbom_boardgame_local_data_v1_';
-        const DEFAULT_TEACHERS = ['김선생님', '이선생님', '박선생님', '최선생님', '정선생님'];
+        const DEFAULT_TEACHERS = ["김선생님", "이선생님", "박선생님", "최선생님", "정선생님"];
+        const CONFIG_STORAGE_KEY = "neulbom_boardgame_firebase_config_v1";
 
-        function getLocalStorageSafe() {
-            try {
-                return window.localStorage || null;
-            } catch (e) {
-                return null;
-            }
+        let state = {
+            groupId: "neulbom-boardgame-share",
+            firebaseConfig: null,
+            isCloudConnected: false,
+            db: null,
+            auth: null,
+            unsubscribers: [],
+            teachers: [...DEFAULT_TEACHERS],
+            currentTeacher: DEFAULT_TEACHERS[0],
+            games: [],
+            lessons: [],
+            snapshots: [],
+            activeTab: "inventory",
+            ownerFilter: "ALL",
+            statusFilter: "ALL",
+            searchQuery: "",
+            lessonFilter: "ALL",
+            currentDetailSnapshot: null
+        };
+
+        // 그룹별 로컬 저장 키 생성 (선생님, 게임, 수업, 스냅샷 통합 저장)
+        function getLocalDataKey() {
+            return `neulbom_boardgame_data_${state.groupId}`;
         }
 
-        function getLocalDataKey(groupId) {
-            return `${LOCAL_DATA_PREFIX}${groupId || 'neulbom-boardgame-share'}`;
-        }
-
-        function readLocalBackup(groupId) {
-            const ls = getLocalStorageSafe();
-            if (!ls) return { teachers: null, games: [], lessons: [], snapshots: [] };
+        function saveToLocalStorage() {
             try {
-                const raw = ls.getItem(getLocalDataKey(groupId));
-                if (!raw) return { teachers: null, games: [], lessons: [], snapshots: [] };
-                const parsed = JSON.parse(raw);
-                return {
-                    teachers: Array.isArray(parsed.teachers) && parsed.teachers.length > 0 ? parsed.teachers : null,
-                    games: Array.isArray(parsed.games) ? parsed.games : [],
-                    lessons: Array.isArray(parsed.lessons) ? parsed.lessons : [],
-                    snapshots: Array.isArray(parsed.snapshots) ? parsed.snapshots : []
-                };
-            } catch (e) {
-                console.warn("로컬 백업 읽기 오류:", e);
-                return { teachers: null, games: [], lessons: [], snapshots: [] };
-            }
-        }
-
-        function writeLocalBackup(groupId, patch) {
-            const ls = getLocalStorageSafe();
-            if (!ls) return;
-            try {
-                const current = readLocalBackup(groupId);
-                const next = {
-                    teachers: patch.teachers !== undefined ? patch.teachers : (current.teachers || teachersList),
-                    games: patch.games !== undefined ? patch.games : allGames,
-                    lessons: patch.lessons !== undefined ? patch.lessons : allLessons,
-                    snapshots: patch.snapshots !== undefined ? patch.snapshots : allSnapshots,
+                const payload = {
+                    teachers: state.teachers,
+                    currentTeacher: state.currentTeacher,
+                    games: state.games,
+                    lessons: state.lessons,
+                    snapshots: state.snapshots,
                     updatedAt: Date.now()
                 };
-                ls.setItem(getLocalDataKey(groupId), JSON.stringify(next));
-            } catch (e) {
-                console.warn("로컬 백업 저장 오류:", e);
+                localStorage.setItem(getLocalDataKey(), JSON.stringify(payload));
+            } catch (err) {
+                console.error("로컬 저장 오류:", err);
+                showToast("브라우저 저장 공간 오류로 저장에 실패했습니다.", "error");
             }
         }
 
-        function resolveAppId() {
-            if (typeof __app_id !== 'undefined' && __app_id) return String(__app_id).trim();
-            const ls = getLocalStorageSafe();
-            if (ls) {
-                try {
-                    const savedGroup = ls.getItem(STORAGE_KEY_GROUP);
-                    if (savedGroup && savedGroup.trim()) return savedGroup.trim();
-                } catch (e) {}
-            }
-            return 'neulbom-boardgame-share';
-        }
-
-        function resolveFirebaseConfig() {
-            if (typeof __firebase_config !== 'undefined' && __firebase_config) {
-                try {
-                    return typeof __firebase_config === 'string' ? JSON.parse(__firebase_config) : __firebase_config;
-                } catch (e) {
-                    console.error("환경 Firebase 설정 파싱 오류:", e);
-                }
-            }
-            const ls = getLocalStorageSafe();
-            if (ls) {
-                try {
-                    const savedRaw = ls.getItem(STORAGE_KEY_CONFIG);
-                    if (savedRaw) {
-                        return JSON.parse(savedRaw);
-                    }
-                } catch (e) {
-                    console.error("저장된 Firebase 설정 파싱 오류:", e);
-                }
-            }
-            return null;
-        }
-
-        // ==========================================
-        // 2. 앱 상태 변수
-        // ==========================================
-        let appId = resolveAppId();
-        let firebaseConfig = resolveFirebaseConfig();
-
-        let app, db, auth;
-        let currentUser = null;
-        let isCloudConnected = false;
-        let unsubSettings = null;
-        let unsubGames = null;
-        let unsubLessons = null;
-        let unsubSnapshots = null;
-
-        let teachersList = [...DEFAULT_TEACHERS];
-        let draftTeachersList = [...DEFAULT_TEACHERS];
-        let currentTeacher = teachersList[0];
-        let selectedOwnerFilter = 'ALL';
-        let selectedStatusFilter = 'ALL';
-        let selectedLessonFilter = 'ALL';
-        let searchQuery = '';
-        let activeTab = 'inventory';
-
-        let allGames = [];
-        let allLessons = [];
-        let allSnapshots = [];
-        let activeSnapshotForCopy = null;
-
-        let deleteTargetId = null;
-        let deleteTargetType = null;
-
-        // ==========================================
-        // 3. DOM 요소 참조
-        // ==========================================
-        const connectionStatus = document.getElementById('connection-status');
-        const roomIdDisplay = document.getElementById('room-id-display');
-        const currentTeacherSelect = document.getElementById('current-teacher-select');
-        const loadingSpinner = document.getElementById('loading-spinner');
-        const gamesGrid = document.getElementById('games-grid');
-        const emptyState = document.getElementById('empty-state');
-        const ownerFilterContainer = document.getElementById('owner-filter-container');
-        const statusFilterSelect = document.getElementById('status-filter-select');
-        const searchInput = document.getElementById('search-input');
-
-        // 토스트 알림
-        let toastTimer = null;
-        function showToast(message, type = 'success') {
-            const toast = document.getElementById('toast');
-            toast.textContent = message;
-            toast.className = `fixed bottom-5 right-5 z-50 max-w-sm px-4 py-3 rounded-2xl shadow-lg text-white text-xs sm:text-sm font-semibold transition-all ${
-                type === 'error' ? 'bg-rose-600' : 'bg-slate-900'
-            }`;
-            toast.classList.remove('hidden');
-            clearTimeout(toastTimer);
-            toastTimer = setTimeout(() => {
-                toast.classList.add('hidden');
-            }, 3000);
-        }
-
-        function ensureDbReady() {
-            return Boolean(isCloudConnected && currentUser && db);
-        }
-
-        // ==========================================
-        // 4. 초기화 및 데이터 구독
-        // ==========================================
-        async function initApp() {
-            appId = resolveAppId();
-            firebaseConfig = resolveFirebaseConfig();
-            roomIdDisplay.textContent = `공유 그룹 ID: ${appId}`;
-            isCloudConnected = false;
-
-            const noticeBanner = document.getElementById('external-host-notice');
-
-            if (unsubSettings) { unsubSettings(); unsubSettings = null; }
-            if (unsubGames) { unsubGames(); unsubGames = null; }
-            if (unsubLessons) { unsubLessons(); unsubLessons = null; }
-            if (unsubSnapshots) { unsubSnapshots(); unsubSnapshots = null; }
-            currentUser = null;
-
-            const localBackup = readLocalBackup(appId);
-            if (localBackup.teachers) {
-                teachersList = [...localBackup.teachers];
-            }
-            if (!teachersList.includes(currentTeacher)) {
-                currentTeacher = teachersList[0] || '김선생님';
-            }
-            if (localBackup.games.length > 0) {
-                allGames = [...localBackup.games].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-            }
-            if (localBackup.lessons.length > 0) {
-                allLessons = [...localBackup.lessons].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-            }
-            if (localBackup.snapshots.length > 0) {
-                allSnapshots = [...localBackup.snapshots].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-            }
-
-            const subtitleEl = document.getElementById('header-subtitle');
-            if (subtitleEl) {
-                subtitleEl.textContent = `${teachersList.length}인 교사 공동 보유 및 순환 대여 현황판`;
-            }
-
-            updateTeacherUI();
-            updateDashboardStats();
-            renderGames();
-            renderLessons();
-            renderSnapshots();
-
-            if (!firebaseConfig || !firebaseConfig.apiKey || !firebaseConfig.projectId) {
-                connectionStatus.classList.remove('bg-emerald-400', 'bg-rose-500');
-                connectionStatus.classList.add('bg-amber-400');
-                connectionStatus.title = "브라우저 저장 모드";
-                if (noticeBanner) noticeBanner.classList.remove('hidden');
-                loadingSpinner.classList.add('hidden');
-                return;
-            }
-
-            if (noticeBanner) noticeBanner.classList.add('hidden');
-
+        function loadFromLocalStorage() {
             try {
-                const appName = `neulbom_app_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-                app = initializeApp(firebaseConfig, appName);
-                auth = getAuth(app);
-                db = getFirestore(app);
-
-                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                    const userCred = await signInWithCustomToken(auth, __initial_auth_token);
-                    currentUser = userCred.user;
+                const raw = localStorage.getItem(getLocalDataKey());
+                if (raw) {
+                    const parsed = JSON.parse(raw);
+                    state.teachers = Array.isArray(parsed.teachers) && parsed.teachers.length > 0
+                        ? parsed.teachers
+                        : [...DEFAULT_TEACHERS];
+                    state.currentTeacher = state.teachers.includes(parsed.currentTeacher)
+                        ? parsed.currentTeacher
+                        : state.teachers[0];
+                    state.games = Array.isArray(parsed.games) ? parsed.games : [];
+                    state.lessons = Array.isArray(parsed.lessons) ? parsed.lessons : [];
+                    state.snapshots = Array.isArray(parsed.snapshots) ? parsed.snapshots : [];
                 } else {
-                    const userCred = await signInAnonymously(auth);
-                    currentUser = userCred.user;
+                    state.teachers = [...DEFAULT_TEACHERS];
+                    state.currentTeacher = state.teachers[0];
+                    state.games = [];
+                    state.lessons = [];
+                    state.snapshots = [];
                 }
-
-                isCloudConnected = true;
-                connectionStatus.classList.remove('bg-amber-400', 'bg-rose-500');
-                connectionStatus.classList.add('bg-emerald-400');
-                connectionStatus.title = "실시간 클라우드 동기화 연결됨";
-
-                subscribeToSettings();
-                subscribeToGames();
-                subscribeToLessons();
-                subscribeToSnapshots();
-            } catch (error) {
-                console.error("Firebase 초기화 오류:", error);
-                isCloudConnected = false;
-                connectionStatus.classList.remove('bg-amber-400', 'bg-emerald-400');
-                connectionStatus.classList.add('bg-rose-500');
-                if (noticeBanner) noticeBanner.classList.remove('hidden');
-                loadingSpinner.classList.add('hidden');
-                showToast("클라우드 연결에 실패하여 브라우저 저장 모드로 동작합니다.", "error");
+            } catch (err) {
+                console.error("로컬 불러오기 오류:", err);
             }
         }
 
-        function subscribeToSettings() {
-            if (!currentUser) return;
-            const settingsDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'teachers');
-            unsubSettings = onSnapshot(settingsDocRef, (docSnap) => {
-                if (docSnap.exists() && Array.isArray(docSnap.data().list) && docSnap.data().list.length > 0) {
-                    teachersList = docSnap.data().list;
-                    if (!teachersList.includes(currentTeacher)) {
-                        currentTeacher = teachersList[0];
-                    }
-                    writeLocalBackup(appId, { teachers: teachersList });
-                } else {
-                    const localBackup = readLocalBackup(appId);
-                    if (localBackup.teachers && localBackup.teachers.length > 0) {
-                        teachersList = [...localBackup.teachers];
-                        setDoc(settingsDocRef, { list: teachersList, updatedAt: Date.now() }, { merge: true }).catch(() => {});
-                    }
-                }
-                const subtitleEl = document.getElementById('header-subtitle');
-                if (subtitleEl) {
-                    subtitleEl.textContent = `${teachersList.length}인 교사 공동 보유 및 순환 대여 현황판`;
-                }
-                updateTeacherUI();
-            }, (error) => {
-                console.error("선생님 설정 구독 오류:", error);
-            });
+        function generateId(prefix = "id") {
+            return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         }
 
-        function subscribeToGames() {
-            if (!currentUser) return;
-            const gamesColRef = collection(db, 'artifacts', appId, 'public', 'data', 'boardgames');
-            unsubGames = onSnapshot(gamesColRef, (snapshot) => {
-                loadingSpinner.classList.add('hidden');
-                const loadedGames = [];
-                snapshot.forEach((docSnap) => {
-                    loadedGames.push({ id: docSnap.id, ...docSnap.data() });
-                });
-                loadedGames.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-                allGames = loadedGames;
-                writeLocalBackup(appId, { games: allGames });
-                updateDashboardStats();
-                renderGames();
-            }, (error) => {
-                console.error("보드게임 목록 구독 오류:", error);
-                loadingSpinner.classList.add('hidden');
-            });
-        }
-
-        function subscribeToLessons() {
-            if (!currentUser) return;
-            const lessonsColRef = collection(db, 'artifacts', appId, 'public', 'data', 'lessons');
-            unsubLessons = onSnapshot(lessonsColRef, (snapshot) => {
-                const loadedLessons = [];
-                snapshot.forEach((docSnap) => {
-                    loadedLessons.push({ id: docSnap.id, ...docSnap.data() });
-                });
-                loadedLessons.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-                allLessons = loadedLessons;
-                writeLocalBackup(appId, { lessons: allLessons });
-                renderLessons();
-            }, (error) => {
-                console.error("수업 기록 구독 오류:", error);
-            });
-        }
-
-        function subscribeToSnapshots() {
-            if (!currentUser) return;
-            const snapshotsColRef = collection(db, 'artifacts', appId, 'public', 'data', 'snapshots');
-            unsubSnapshots = onSnapshot(snapshotsColRef, (snapshot) => {
-                const loadedSnapshots = [];
-                snapshot.forEach((docSnap) => {
-                    loadedSnapshots.push({ id: docSnap.id, ...docSnap.data() });
-                });
-                loadedSnapshots.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-                allSnapshots = loadedSnapshots;
-                writeLocalBackup(appId, { snapshots: allSnapshots });
-                const badge = document.getElementById('snapshot-count-badge');
-                if (badge) badge.textContent = allSnapshots.length;
-                renderSnapshots();
-            }, (error) => {
-                console.error("저장된 기록 구독 오류:", error);
-            });
-        }
-
-        // ==========================================
-        // 5. UI 렌더링 함수들
-        // ==========================================
-        function updateTeacherUI() {
-            currentTeacherSelect.innerHTML = '';
-            teachersList.forEach((name) => {
-                const opt = document.createElement('option');
-                opt.value = name;
-                opt.textContent = name;
-                if (name === currentTeacher) opt.selected = true;
-                currentTeacherSelect.appendChild(opt);
-            });
-
-            ownerFilterContainer.innerHTML = '';
-            const allBtn = document.createElement('button');
-            allBtn.type = 'button';
-            allBtn.textContent = `전체 (${allGames.length})`;
-            allBtn.className = `px-3.5 py-1.5 rounded-xl text-xs sm:text-sm font-bold transition ${
-                selectedOwnerFilter === 'ALL'
-                    ? 'bg-indigo-600 text-white shadow-xs'
-                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-            }`;
-            allBtn.addEventListener('click', () => {
-                selectedOwnerFilter = 'ALL';
-                updateTeacherUI();
-                renderGames();
-            });
-            ownerFilterContainer.appendChild(allBtn);
-
-            teachersList.forEach((teacherName) => {
-                const count = allGames.filter(g => g.owner === teacherName).length;
-                const btn = document.createElement('button');
-                btn.type = 'button';
-                btn.textContent = `${teacherName} (${count})`;
-                btn.className = `px-3.5 py-1.5 rounded-xl text-xs sm:text-sm font-semibold transition ${
-                    selectedOwnerFilter === teacherName
-                        ? 'bg-indigo-600 text-white shadow-xs'
-                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                }`;
-                btn.addEventListener('click', () => {
-                    selectedOwnerFilter = teacherName;
-                    updateTeacherUI();
-                    renderGames();
-                });
-                ownerFilterContainer.appendChild(btn);
-            });
-        }
-
-        function updateDashboardStats() {
-            const total = allGames.length;
-            const borrowed = allGames.filter(g => g.status === 'borrowed').length;
-            const available = total - borrowed;
-
-            document.getElementById('stat-total-games').textContent = `${total}종`;
-            document.getElementById('stat-available-games').textContent = `${available}종`;
-            document.getElementById('stat-borrowed-games').textContent = `${borrowed}종`;
-            document.getElementById('stat-teacher-count').textContent = `${teachersList.length}명`;
-
-            const snapBadge = document.getElementById('snapshot-count-badge');
-            if (snapBadge) snapBadge.textContent = allSnapshots.length;
+        function formatDateTime(ts) {
+            if (!ts) return "-";
+            const d = new Date(ts);
+            const yyyy = d.getFullYear();
+            const mm = String(d.getMonth() + 1).padStart(2, "0");
+            const dd = String(d.getDate()).padStart(2, "0");
+            const hh = String(d.getHours()).padStart(2, "0");
+            const min = String(d.getMinutes()).padStart(2, "0");
+            return `${yyyy}.${mm}.${dd} ${hh}:${min}`;
         }
 
         function escapeHtml(str) {
-            return String(str || '')
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;');
-        }
-
-        function renderGames() {
-            const filtered = allGames.filter((game) => {
-                const matchOwner = selectedOwnerFilter === 'ALL' || game.owner === selectedOwnerFilter;
-                const matchStatus = selectedStatusFilter === 'ALL' || game.status === selectedStatusFilter;
-                const q = searchQuery.trim().toLowerCase();
-                const matchQuery = !q || (
-                    (game.name || '').toLowerCase().includes(q) ||
-                    (game.owner || '').toLowerCase().includes(q) ||
-                    (game.genre || '').toLowerCase().includes(q) ||
-                    (game.notes || '').toLowerCase().includes(q)
-                );
-                return matchOwner && matchStatus && matchQuery;
-            });
-
-            gamesGrid.innerHTML = '';
-
-            if (filtered.length === 0) {
-                emptyState.classList.remove('hidden');
-                return;
-            }
-            emptyState.classList.add('hidden');
-
-            filtered.forEach((game) => {
-                const isBorrowed = game.status === 'borrowed';
-                const card = document.createElement('div');
-                card.className = 'bg-white rounded-2xl p-5 border border-slate-200/90 shadow-sm hover:shadow-md transition flex flex-col justify-between gap-4';
-
-                card.innerHTML = `
-                    <div class="space-y-2.5">
-                        <div class="flex items-start justify-between gap-2">
-                            <div>
-                                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold ${
-                                    isBorrowed
-                                        ? 'bg-amber-100 text-amber-800'
-                                        : 'bg-emerald-100 text-emerald-800'
-                                }">
-                                    ${isBorrowed ? `📌 ${escapeHtml(game.borrower || '선생님')} 수업 대여 중` : '✅ 대여 가능'}
-                                </span>
-                                <h3 class="text-base sm:text-lg font-bold text-slate-800 mt-1.5">${escapeHtml(game.name)}</h3>
-                            </div>
-                            <div class="flex items-center gap-1">
-                                <button type="button" onclick="window.openEditGameModal('${game.id}')" class="p-1.5 rounded-lg text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 text-xs font-bold" title="수정">✏️</button>
-                                <button type="button" onclick="window.promptDeleteGame('${game.id}', '${escapeHtml(game.name)}')" class="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 text-xs font-bold" title="삭제">🗑️</button>
-                            </div>
-                        </div>
-
-                        <div class="flex flex-wrap gap-1.5 text-xs">
-                            <span class="px-2.5 py-1 rounded-lg bg-indigo-50 text-indigo-700 font-semibold">보유: ${escapeHtml(game.owner)}</span>
-                            ${game.genre ? `<span class="px-2.5 py-1 rounded-lg bg-slate-100 text-slate-600 font-medium">${escapeHtml(game.genre)}</span>` : ''}
-                            ${game.players ? `<span class="px-2.5 py-1 rounded-lg bg-slate-100 text-slate-600 font-medium">${escapeHtml(game.players)}</span>` : ''}
-                        </div>
-
-                        ${game.notes ? `<p class="text-xs text-slate-600 bg-slate-50 p-2.5 rounded-xl leading-relaxed">${escapeHtml(game.notes)}</p>` : ''}
-                    </div>
-
-                    <div class="pt-2 border-t border-slate-100 flex items-center justify-between gap-2">
-                        ${
-                            isBorrowed
-                                ? `<button type="button" onclick="window.toggleBorrow('${game.id}', 'return')" class="w-full py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs sm:text-sm font-bold transition">
-                                    ↩️ 수업 완료 (반납하기)
-                                   </button>`
-                                : `<button type="button" onclick="window.toggleBorrow('${game.id}', 'borrow')" class="w-full py-2 px-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs sm:text-sm font-bold transition">
-                                    🎲 ${escapeHtml(currentTeacher)} 대여하기
-                                   </button>`
-                        }
-                    </div>
-                `;
-                gamesGrid.appendChild(card);
-            });
-        }
-
-        function renderLessons() {
-            const container = document.getElementById('lessons-container');
-            const emptyEl = document.getElementById('lessons-empty-state');
-            if (!container || !emptyEl) return;
-
-            const filtered = allLessons.filter(l => selectedLessonFilter === 'ALL' || l.status === selectedLessonFilter);
-            container.innerHTML = '';
-
-            if (filtered.length === 0) {
-                emptyEl.classList.remove('hidden');
-                return;
-            }
-            emptyEl.classList.add('hidden');
-
-            filtered.forEach((lesson) => {
-                const isCompleted = lesson.status === 'completed';
-                const card = document.createElement('div');
-                card.className = 'bg-white rounded-2xl p-5 border border-slate-200/90 shadow-sm space-y-3';
-
-                const gamesBadges = Array.isArray(lesson.gamesUsed) && lesson.gamesUsed.length > 0
-                    ? lesson.gamesUsed.map(g => `<span class="px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 text-xs font-semibold">🎲 ${escapeHtml(g)}</span>`).join('')
-                    : '<span class="text-xs text-slate-400">선택된 게임 없음</span>';
-
-                card.innerHTML = `
-                    <div class="flex items-start justify-between gap-2">
-                        <div>
-                            <div class="flex items-center gap-2 flex-wrap">
-                                <span class="px-2.5 py-0.5 rounded-full text-xs font-bold ${
-                                    isCompleted ? 'bg-slate-200 text-slate-700' : 'bg-blue-100 text-blue-800'
-                                }">
-                                    ${isCompleted ? '✅ 완료 기록' : '📅 예정 수업'}
-                                </span>
-                                <span class="text-xs font-bold text-indigo-600">${escapeHtml(lesson.week)}</span>
-                                <span class="text-xs font-semibold text-slate-600">· ${escapeHtml(lesson.teacher)}</span>
-                            </div>
-                            <h3 class="text-base font-bold text-slate-800 mt-1.5">${escapeHtml(lesson.topic)}</h3>
-                            ${lesson.classInfo ? `<p class="text-xs text-slate-500 mt-0.5">수업 대상: ${escapeHtml(lesson.classInfo)}</p>` : ''}
-                        </div>
-                        <div class="flex items-center gap-1">
-                            <button type="button" onclick="window.openEditLessonModal('${lesson.id}')" class="p-1.5 rounded-lg text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 text-xs">✏️</button>
-                            <button type="button" onclick="window.promptDeleteLesson('${lesson.id}', '${escapeHtml(lesson.topic)}')" class="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 text-xs">🗑️</button>
-                        </div>
-                    </div>
-
-                    <div class="flex flex-wrap gap-1.5">${gamesBadges}</div>
-
-                    ${lesson.notes ? `<p class="text-xs text-slate-600 bg-slate-50 p-3 rounded-xl leading-relaxed">${escapeHtml(lesson.notes)}</p>` : ''}
-
-                    ${
-                        !isCompleted
-                            ? `<div class="pt-1 flex justify-end">
-                                <button type="button" onclick="window.markLessonCompleted('${lesson.id}')" class="px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-xs font-bold transition">
-                                    ✓ 수업 완료 기록으로 저장
-                                </button>
-                               </div>`
-                            : ''
-                    }
-                `;
-                container.appendChild(card);
-            });
-        }
-
-        function renderSnapshots() {
-            const container = document.getElementById('snapshots-container');
-            const emptyEl = document.getElementById('snapshots-empty-state');
-            if (!container || !emptyEl) return;
-
-            container.innerHTML = '';
-            if (allSnapshots.length === 0) {
-                emptyEl.classList.remove('hidden');
-                return;
-            }
-            emptyEl.classList.add('hidden');
-
-            allSnapshots.forEach((snap) => {
-                const gameCount = Array.isArray(snap.games) ? snap.games.length : 0;
-                const lessonCount = Array.isArray(snap.lessons) ? snap.lessons.length : 0;
-                const teacherCount = Array.isArray(snap.teachers) ? snap.teachers.length : 0;
-
-                const card = document.createElement('div');
-                card.className = 'bg-white rounded-2xl p-5 border border-slate-200/90 shadow-sm space-y-3';
-                card.innerHTML = `
-                    <div class="flex items-start justify-between gap-2">
-                        <div>
-                            <h3 class="text-base font-bold text-slate-800">${escapeHtml(snap.title)}</h3>
-                            <p class="text-xs text-slate-500 mt-0.5">${escapeHtml(snap.createdAtText || '')} · 저장자: ${escapeHtml(snap.savedBy || '')}</p>
-                        </div>
-                        <button type="button" onclick="window.promptDeleteSnapshot('${snap.id}', '${escapeHtml(snap.title)}')" class="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 text-xs">🗑️</button>
-                    </div>
-                    ${snap.memo ? `<p class="text-xs text-slate-600 bg-slate-50 p-2.5 rounded-xl">${escapeHtml(snap.memo)}</p>` : ''}
-                    <div class="flex flex-wrap gap-2 text-xs font-semibold">
-                        <span class="px-2.5 py-1 rounded-lg bg-indigo-50 text-indigo-700">선생님 ${teacherCount}명</span>
-                        <span class="px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700">보유 게임 ${gameCount}종</span>
-                        <span class="px-2.5 py-1 rounded-lg bg-amber-50 text-amber-700">수업 기록 ${lessonCount}건</span>
-                    </div>
-                    <div class="pt-1 flex justify-end">
-                        <button type="button" onclick="window.openSnapshotDetail('${snap.id}')" class="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold">
-                            기록 상세보기 및 복사
-                        </button>
-                    </div>
-                `;
-                container.appendChild(card);
-            });
+            if (str === null || str === undefined) return "";
+            return String(str)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
         }
 
         // ==========================================
-        // 6. 대여, 수업 상태, 모달 제어 함수들
+        // 2. 토스트 & 확인 모달
         // ==========================================
-        window.toggleBorrow = async (gameId, action) => {
-            const targetGame = allGames.find(g => g.id === gameId);
-            if (!targetGame) return;
-
-            const updatedData = action === 'borrow'
-                ? { status: 'borrowed', borrower: currentTeacher, borrowedAt: Date.now() }
-                : { status: 'available', borrower: null, borrowedAt: null };
-
-            try {
-                if (ensureDbReady()) {
-                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'boardgames', gameId), updatedData);
-                } else {
-                    allGames = allGames.map(g => g.id === gameId ? { ...g, ...updatedData } : g);
-                    writeLocalBackup(appId, { games: allGames });
-                    updateDashboardStats();
-                    renderGames();
-                }
-                showToast(
-                    action === 'borrow'
-                        ? `'${targetGame.name}' 보드게임을 ${currentTeacher}이(가) 대여했습니다.`
-                        : `'${targetGame.name}' 보드게임이 반납되었습니다.`
-                );
-            } catch (error) {
-                console.error("상태 변경 오류:", error);
-                showToast("상태 변경 중 오류가 발생했습니다.", "error");
-            }
-        };
-
-        window.markLessonCompleted = async (lessonId) => {
-            try {
-                if (ensureDbReady()) {
-                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'lessons', lessonId), {
-                        status: 'completed',
-                        completedAt: Date.now()
-                    });
-                } else {
-                    allLessons = allLessons.map(l => l.id === lessonId ? { ...l, status: 'completed', completedAt: Date.now() } : l);
-                    writeLocalBackup(appId, { lessons: allLessons });
-                    renderLessons();
-                }
-                showToast("수업이 완료 기록으로 저장되었습니다.");
-            } catch (error) {
-                console.error("수업 완료 처리 오류:", error);
-                showToast("수업 상태 변경 중 오류가 발생했습니다.", "error");
-            }
-        };
-
-        // 게임 등록/수정 모달
-        function openGameModal(gameToEdit = null) {
-            const modal = document.getElementById('game-modal');
-            const ownerSelect = document.getElementById('game-owner-input');
-            ownerSelect.innerHTML = '';
-            teachersList.forEach(t => {
-                const opt = document.createElement('option');
-                opt.value = t;
-                opt.textContent = t;
-                ownerSelect.appendChild(opt);
-            });
-
-            if (gameToEdit) {
-                document.getElementById('game-modal-title').textContent = '보드게임 정보 수정';
-                document.getElementById('edit-game-id').value = gameToEdit.id;
-                document.getElementById('game-name-input').value = gameToEdit.name || '';
-                ownerSelect.value = teachersList.includes(gameToEdit.owner) ? gameToEdit.owner : teachersList[0];
-                document.getElementById('game-players-input').value = gameToEdit.players || '';
-                document.getElementById('game-genre-input').value = gameToEdit.genre || '';
-                document.getElementById('game-notes-input').value = gameToEdit.notes || '';
+        let toastTimer = null;
+        function showToast(message, type = "success") {
+            const el = document.getElementById("toast");
+            el.textContent = message;
+            el.className = "fixed bottom-5 right-5 z-50 max-w-sm px-4 py-3 rounded-2xl shadow-lg text-white text-xs sm:text-sm font-semibold transition-all";
+            if (type === "error") {
+                el.classList.add("bg-rose-600");
+            } else if (type === "info") {
+                el.classList.add("bg-indigo-600");
             } else {
-                document.getElementById('game-modal-title').textContent = '새 보드게임 등록';
-                document.getElementById('edit-game-id').value = '';
-                document.getElementById('game-name-input').value = '';
-                ownerSelect.value = teachersList.includes(currentTeacher) ? currentTeacher : teachersList[0];
-                document.getElementById('game-players-input').value = '';
-                document.getElementById('game-genre-input').value = '';
-                document.getElementById('game-notes-input').value = '';
+                el.classList.add("bg-emerald-600");
             }
-            modal.classList.remove('hidden');
+            el.classList.remove("hidden");
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => {
+                el.classList.add("hidden");
+            }, 3000);
         }
 
-        function closeGameModal() {
-            document.getElementById('game-modal').classList.add('hidden');
-        }
+        function openConfirmModal(title, message) {
+            return new Promise((resolve) => {
+                const modal = document.getElementById("confirm-modal");
+                document.getElementById("confirm-title").textContent = title;
+                document.getElementById("confirm-message").textContent = message;
+                modal.classList.remove("hidden");
 
-        window.openEditGameModal = (gameId) => {
-            const target = allGames.find(g => g.id === gameId);
-            if (target) openGameModal(target);
-        };
+                const okBtn = document.getElementById("confirm-ok-btn");
+                const cancelBtn = document.getElementById("confirm-cancel-btn");
 
-        document.getElementById('open-add-game-btn').addEventListener('click', () => openGameModal(null));
-        document.getElementById('close-game-modal-btn').addEventListener('click', closeGameModal);
-        document.getElementById('cancel-game-modal-btn').addEventListener('click', closeGameModal);
+                const cleanup = (result) => {
+                    modal.classList.add("hidden");
+                    okBtn.onclick = null;
+                    cancelBtn.onclick = null;
+                    resolve(result);
+                };
 
-        document.getElementById('game-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const editId = document.getElementById('edit-game-id').value;
-            const name = document.getElementById('game-name-input').value.trim();
-            const owner = document.getElementById('game-owner-input').value;
-            const players = document.getElementById('game-players-input').value.trim();
-            const genre = document.getElementById('game-genre-input').value.trim();
-            const notes = document.getElementById('game-notes-input').value.trim();
-
-            if (!name) {
-                showToast("보드게임 이름을 입력해 주세요.", "error");
-                return;
-            }
-
-            const payload = { name, owner, players, genre, notes, updatedAt: Date.now() };
-
-            try {
-                if (editId) {
-                    if (ensureDbReady()) {
-                        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'boardgames', editId), payload);
-                    } else {
-                        allGames = allGames.map(g => g.id === editId ? { ...g, ...payload } : g);
-                        writeLocalBackup(appId, { games: allGames });
-                        updateDashboardStats();
-                        renderGames();
-                    }
-                    showToast(`'${name}' 정보가 수정되었습니다.`);
-                } else {
-                    const newGameDoc = {
-                        ...payload,
-                        status: 'available',
-                        borrower: null,
-                        borrowedAt: null,
-                        createdAt: Date.now()
-                    };
-                    if (ensureDbReady()) {
-                        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'boardgames'), newGameDoc);
-                    } else {
-                        allGames = [{ id: `local_game_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, ...newGameDoc }, ...allGames];
-                        writeLocalBackup(appId, { games: allGames });
-                        updateDashboardStats();
-                        renderGames();
-                    }
-                    showToast(`'${name}' 보드게임이 저장되었습니다.`);
-                }
-                closeGameModal();
-            } catch (error) {
-                console.error("게임 저장 오류:", error);
-                showToast("저장 중 오류가 발생했습니다.", "error");
-            }
-        });
-
-        // 선생님 이름 설정 / 인원 추가 모달
-        function renderDraftTeachersInputs() {
-            const listEl = document.getElementById('teachers-inputs-list');
-            const bulkSelect = document.getElementById('teacher-bulk-owner-select');
-            listEl.innerHTML = '';
-            bulkSelect.innerHTML = '';
-
-            draftTeachersList.forEach((tName, idx) => {
-                const row = document.createElement('div');
-                row.className = 'flex items-center gap-2';
-                row.innerHTML = `
-                    <span class="text-xs font-bold text-slate-400 w-6 text-center">${idx + 1}</span>
-                    <input id="teacher-name-input-${idx}" type="text" value="${escapeHtml(tName)}" class="flex-1 px-3 py-2 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-                    ${
-                        draftTeachersList.length > 1
-                            ? `<button type="button" onclick="window.removeDraftTeacher(${idx})" class="px-2.5 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-600 text-xs font-bold" title="삭제">🗑️</button>`
-                            : ''
-                    }
-                `;
-                listEl.appendChild(row);
-
-                const opt = document.createElement('option');
-                opt.value = tName;
-                opt.textContent = tName;
-                bulkSelect.appendChild(opt);
+                okBtn.onclick = () => cleanup(true);
+                cancelBtn.onclick = () => cleanup(false);
             });
         }
 
-        window.removeDraftTeacher = (idx) => {
-            if (draftTeachersList.length <= 1) return;
-            draftTeachersList.splice(idx, 1);
-            renderDraftTeachersInputs();
-        };
-
-        function openTeachersModal() {
-            draftTeachersList = [...teachersList];
-            document.getElementById('teacher-bulk-games-input').value = '';
-            renderDraftTeachersInputs();
-            document.getElementById('teachers-modal').classList.remove('hidden');
+        // ==========================================
+        // 3. 데이터 CRUD (클라우드 + 로컬 통합 보장)
+        // ==========================================
+        function getRoomDocRef() {
+            return doc(state.db, "neulbom_boardgame_rooms", state.groupId);
         }
 
-        function closeTeachersModal() {
-            document.getElementById('teachers-modal').classList.add('hidden');
-        }
+        async function persistTeachers(newTeachers, newCurrentTeacher) {
+            state.teachers = newTeachers;
+            state.currentTeacher = newCurrentTeacher;
+            saveToLocalStorage();
+            renderAll();
 
-        document.getElementById('open-teachers-modal-btn').addEventListener('click', openTeachersModal);
-        document.getElementById('close-teachers-modal-btn').addEventListener('click', closeTeachersModal);
-        document.getElementById('cancel-teachers-modal-btn').addEventListener('click', closeTeachersModal);
-
-        document.getElementById('add-teacher-row-btn').addEventListener('click', () => {
-            draftTeachersList.push(`새선생님${draftTeachersList.length + 1}`);
-            renderDraftTeachersInputs();
-        });
-
-        document.getElementById('teachers-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const newList = [];
-            const nameRenameMap = {};
-
-            for (let i = 0; i < draftTeachersList.length; i++) {
-                const inputEl = document.getElementById(`teacher-name-input-${i}`);
-                const oldName = draftTeachersList[i];
-                const newName = inputEl ? inputEl.value.trim() : oldName;
-                if (!newName) {
-                    showToast(`${i + 1}번째 선생님의 이름을 입력해 주세요.`, "error");
-                    if (inputEl) inputEl.focus();
-                    return;
-                }
-                if (newList.includes(newName)) {
-                    showToast(`'${newName}' 이름이 중복되었습니다.`, "error");
-                    if (inputEl) inputEl.focus();
-                    return;
-                }
-                newList.push(newName);
-                if (oldName !== newName) {
-                    nameRenameMap[oldName] = newName;
-                }
-            }
-
-            const targetTeacherForGames = document.getElementById('teacher-bulk-owner-select').value || newList[0];
-            const bulkGamesRaw = document.getElementById('teacher-bulk-games-input').value.trim();
-            const bulkGameNames = bulkGamesRaw
-                ? bulkGamesRaw.split(',').map(s => s.trim()).filter(Boolean)
-                : [];
-
-            try {
-                const cloudReady = ensureDbReady();
-                if (cloudReady) {
-                    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'teachers'), {
-                        list: newList,
+            if (state.isCloudConnected && state.db) {
+                try {
+                    await setDoc(getRoomDocRef(), {
+                        teachers: state.teachers,
                         updatedAt: Date.now()
                     }, { merge: true });
+                } catch (err) {
+                    console.error("클라우드 선생님 저장 실패:", err);
+                    showToast("클라우드 동기화 실패 (브라우저에는 저장됨)", "info");
                 }
+            }
+        }
 
-                const renameEntries = Object.entries(nameRenameMap);
-                if (renameEntries.length > 0) {
-                    allGames = allGames.map(game => {
-                        let nextOwner = game.owner;
-                        let nextBorrower = game.borrower;
-                        let changed = false;
-                        renameEntries.forEach(([oldN, newN]) => {
-                            if (nextOwner === oldN) { nextOwner = newN; changed = true; }
-                            if (nextBorrower === oldN) { nextBorrower = newN; changed = true; }
-                        });
-                        if (changed && cloudReady) {
-                            updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'boardgames', game.id), {
-                                owner: nextOwner,
-                                borrower: nextBorrower,
-                                updatedAt: Date.now()
-                            }).catch(() => {});
-                        }
-                        return changed ? { ...game, owner: nextOwner, borrower: nextBorrower } : game;
-                    });
-
-                    allLessons = allLessons.map(lesson => {
-                        if (nameRenameMap[lesson.teacher]) {
-                            const updatedTeacher = nameRenameMap[lesson.teacher];
-                            if (cloudReady) {
-                                updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'lessons', lesson.id), {
-                                    teacher: updatedTeacher,
-                                    updatedAt: Date.now()
-                                }).catch(() => {});
-                            }
-                            return { ...lesson, teacher: updatedTeacher };
-                        }
-                        return lesson;
-                    });
+        async function persistGame(gameData, existingId = null) {
+            const now = Date.now();
+            if (existingId) {
+                const idx = state.games.findIndex((g) => g.id === existingId);
+                if (idx !== -1) {
+                    state.games[idx] = { ...state.games[idx], ...gameData, updatedAt: now };
                 }
+                saveToLocalStorage();
+                renderAll();
 
-                if (bulkGameNames.length > 0) {
-                    const baseTime = Date.now();
-                    for (let idx = 0; idx < bulkGameNames.length; idx++) {
-                        const gameItem = {
-                            name: bulkGameNames[idx],
-                            owner: targetTeacherForGames,
-                            genre: '선생님 등록 보유',
-                            players: '',
-                            notes: `${targetTeacherForGames} 보유 게임 등록`,
-                            status: 'available',
-                            borrower: null,
-                            borrowedAt: null,
-                            createdAt: baseTime + idx,
-                            updatedAt: baseTime + idx
-                        };
-                        if (cloudReady) {
-                            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'boardgames'), gameItem);
-                        } else {
-                            allGames = [{ id: `local_game_${baseTime}_${idx}`, ...gameItem }, ...allGames];
-                        }
+                if (state.isCloudConnected && state.db) {
+                    try {
+                        await setDoc(doc(getRoomDocRef(), "games", existingId), {
+                            ...state.games[idx]
+                        }, { merge: true });
+                    } catch (err) {
+                        console.error("클라우드 게임 수정 실패:", err);
                     }
                 }
+            } else {
+                const newId = generateId("game");
+                const newGame = {
+                    id: newId,
+                    name: gameData.name,
+                    owner: gameData.owner,
+                    players: gameData.players || "",
+                    genre: gameData.genre || "",
+                    notes: gameData.notes || "",
+                    status: "available",
+                    borrower: "",
+                    borrowedAt: null,
+                    createdAt: now,
+                    updatedAt: now
+                };
+                state.games.unshift(newGame);
+                saveToLocalStorage();
+                renderAll();
 
-                teachersList = [...newList];
-                if (!newList.includes(currentTeacher)) {
-                    currentTeacher = newList[0];
+                if (state.isCloudConnected && state.db) {
+                    try {
+                        await setDoc(doc(getRoomDocRef(), "games", newId), newGame);
+                    } catch (err) {
+                        console.error("클라우드 게임 추가 실패:", err);
+                    }
                 }
-                if (selectedOwnerFilter !== 'ALL' && !newList.includes(selectedOwnerFilter)) {
-                    selectedOwnerFilter = 'ALL';
-                }
-
-                writeLocalBackup(appId, {
-                    teachers: teachersList,
-                    games: allGames,
-                    lessons: allLessons
-                });
-
-                const subtitleEl = document.getElementById('header-subtitle');
-                if (subtitleEl) {
-                    subtitleEl.textContent = `${teachersList.length}인 교사 공동 보유 및 순환 대여 현황판`;
-                }
-
-                updateTeacherUI();
-                updateDashboardStats();
-                renderGames();
-                renderLessons();
-                closeTeachersModal();
-
-                showToast(
-                    bulkGameNames.length > 0
-                        ? `선생님 명단(${newList.length}명)과 보유 게임 ${bulkGameNames.length}개가 저장되었습니다.`
-                        : `선생님 명단(${newList.length}명)이 저장되었습니다.`
-                );
-            } catch (error) {
-                console.error("선생님 설정 저장 오류:", error);
-                showToast("선생님 설정 저장 중 오류가 발생했습니다.", "error");
             }
-        });
+        }
 
-        // 주차별 수업 모달
-        function openLessonModal(lessonToEdit = null) {
-            const teacherSelect = document.getElementById('lesson-teacher-select');
-            teacherSelect.innerHTML = '';
-            teachersList.forEach(t => {
-                const opt = document.createElement('option');
-                opt.value = t;
-                opt.textContent = t;
-                teacherSelect.appendChild(opt);
+        async function toggleBorrowGame(gameId) {
+            const idx = state.games.findIndex((g) => g.id === gameId);
+            if (idx === -1) return;
+
+            const game = state.games[idx];
+            const isCurrentlyBorrowed = game.status === "borrowed";
+            const updatedFields = isCurrentlyBorrowed
+                ? { status: "available", borrower: "", borrowedAt: null, updatedAt: Date.now() }
+                : { status: "borrowed", borrower: state.currentTeacher, borrowedAt: Date.now(), updatedAt: Date.now() };
+
+            state.games[idx] = { ...game, ...updatedFields };
+            saveToLocalStorage();
+            renderAll();
+
+            showToast(
+                isCurrentlyBorrowed
+                    ? `'${game.name}' 반납 처리되었습니다.`
+                    : `${state.currentTeacher}님이 '${game.name}'을(를) 대여했습니다.`
+            );
+
+            if (state.isCloudConnected && state.db) {
+                try {
+                    await updateDoc(doc(getRoomDocRef(), "games", gameId), updatedFields);
+                } catch (err) {
+                    console.error("클라우드 대여 상태 변경 실패:", err);
+                }
+            }
+        }
+
+        async function removeGame(gameId) {
+            state.games = state.games.filter((g) => g.id !== gameId);
+            saveToLocalStorage();
+            renderAll();
+            showToast("보드게임이 삭제되었습니다.", "info");
+
+            if (state.isCloudConnected && state.db) {
+                try {
+                    await deleteDoc(doc(getRoomDocRef(), "games", gameId));
+                } catch (err) {
+                    console.error("클라우드 게임 삭제 실패:", err);
+                }
+            }
+        }
+
+        async function persistLesson(lessonData, existingId = null) {
+            const now = Date.now();
+            if (existingId) {
+                const idx = state.lessons.findIndex((l) => l.id === existingId);
+                if (idx !== -1) {
+                    state.lessons[idx] = { ...state.lessons[idx], ...lessonData, updatedAt: now };
+                }
+                saveToLocalStorage();
+                renderAll();
+
+                if (state.isCloudConnected && state.db) {
+                    try {
+                        await setDoc(doc(getRoomDocRef(), "lessons", existingId), state.lessons[idx], { merge: true });
+                    } catch (err) {
+                        console.error("클라우드 수업 수정 실패:", err);
+                    }
+                }
+            } else {
+                const newId = generateId("lesson");
+                const newLesson = {
+                    id: newId,
+                    ...lessonData,
+                    createdAt: now,
+                    updatedAt: now
+                };
+                state.lessons.unshift(newLesson);
+                saveToLocalStorage();
+                renderAll();
+
+                if (state.isCloudConnected && state.db) {
+                    try {
+                        await setDoc(doc(getRoomDocRef(), "lessons", newId), newLesson);
+                    } catch (err) {
+                        console.error("클라우드 수업 등록 실패:", err);
+                    }
+                }
+            }
+        }
+
+        async function removeLesson(lessonId) {
+            state.lessons = state.lessons.filter((l) => l.id !== lessonId);
+            saveToLocalStorage();
+            renderAll();
+            showToast("수업 기록이 삭제되었습니다.", "info");
+
+            if (state.isCloudConnected && state.db) {
+                try {
+                    await deleteDoc(doc(getRoomDocRef(), "lessons", lessonId));
+                } catch (err) {
+                    console.error("클라우드 수업 삭제 실패:", err);
+                }
+            }
+        }
+
+        async function persistSnapshot(title, memo) {
+            const now = Date.now();
+            const newId = generateId("snap");
+            const snapshot = {
+                id: newId,
+                title: title.trim() || `${formatDateTime(now)} 현황 기록`,
+                memo: memo.trim(),
+                savedBy: state.currentTeacher,
+                createdAt: now,
+                teachers: [...state.teachers],
+                games: JSON.parse(JSON.stringify(state.games)),
+                lessons: JSON.parse(JSON.stringify(state.lessons))
+            };
+
+            state.snapshots.unshift(snapshot);
+            saveToLocalStorage();
+            renderAll();
+            showToast("현재 전체 현황이 기록으로 저장되었습니다!");
+
+            if (state.isCloudConnected && state.db) {
+                try {
+                    await setDoc(doc(getRoomDocRef(), "snapshots", newId), snapshot);
+                } catch (err) {
+                    console.error("클라우드 스냅샷 저장 실패:", err);
+                }
+            }
+        }
+
+        async function removeSnapshot(snapshotId) {
+            state.snapshots = state.snapshots.filter((s) => s.id !== snapshotId);
+            saveToLocalStorage();
+            renderAll();
+            showToast("저장된 기록이 삭제되었습니다.", "info");
+
+            if (state.isCloudConnected && state.db) {
+                try {
+                    await deleteDoc(doc(getRoomDocRef(), "snapshots", snapshotId));
+                } catch (err) {
+                    console.error("클라우드 스냅샷 삭제 실패:", err);
+                }
+            }
+        }
+
+        // ==========================================
+        // 4. Firebase 연결 및 실시간 동기화 초기화
+        // ==========================================
+        function clearUnsubscribers() {
+            state.unsubscribers.forEach((unsub) => {
+                try { unsub(); } catch (_) {}
+            });
+            state.unsubscribers = [];
+        }
+
+        function updateConnectionUI() {
+            const statusDot = document.getElementById("connection-status");
+            const roomDisplay = document.getElementById("room-id-display");
+            const noticeBanner = document.getElementById("external-host-notice");
+
+            roomDisplay.textContent = `공유 그룹 ID: ${state.groupId}`;
+
+            if (state.isCloudConnected) {
+                statusDot.className = "w-2.5 h-2.5 rounded-full bg-emerald-400 inline-block";
+                statusDot.title = "실시간 클라우드 동기화 연결됨";
+                noticeBanner.classList.add("hidden");
+            } else {
+                statusDot.className = "w-2.5 h-2.5 rounded-full bg-amber-400 inline-block";
+                statusDot.title = "브라우저 저장 모드 (로컬 저장)";
+                noticeBanner.classList.remove("hidden");
+            }
+        }
+
+        async function initStorageAndCloud() {
+            clearUnsubscribers();
+            state.isCloudConnected = false;
+
+            // 1) 저장된 연결 설정 불러오기
+            let savedConfig = null;
+            try {
+                const rawCfg = localStorage.getItem(CONFIG_STORAGE_KEY);
+                if (rawCfg) savedConfig = JSON.parse(rawCfg);
+            } catch (_) {}
+
+            if (savedConfig?.groupId) {
+                state.groupId = savedConfig.groupId;
+            }
+            if (savedConfig?.firebaseConfig && typeof savedConfig.firebaseConfig === "object") {
+                state.firebaseConfig = savedConfig.firebaseConfig;
+            } else if (typeof __firebase_config !== "undefined" && __firebase_config) {
+                try {
+                    state.firebaseConfig = JSON.parse(__firebase_config);
+                } catch (_) {}
+            }
+
+            // 2) 로컬 데이터 먼저 즉시 로드 (화면에 바로 표시되도록 보장)
+            loadFromLocalStorage();
+            updateConnectionUI();
+            renderAll();
+
+            // 3) Firebase 설정이 있는 경우에만 클라우드 연결 시도
+            if (state.firebaseConfig && state.firebaseConfig.apiKey && state.firebaseConfig.projectId) {
+                try {
+                    for (const existingApp of getApps()) {
+                        await deleteApp(existingApp);
+                    }
+                    const app = initializeApp(state.firebaseConfig);
+                    const auth = getAuth(app);
+                    const db = getFirestore(app);
+
+                    if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+
+                    state.auth = auth;
+                    state.db = db;
+                    state.isCloudConnected = true;
+                    updateConnectionUI();
+
+                    // 실시간 구독 연결
+                    const roomRef = getRoomDocRef();
+
+                    const unsubRoom = onSnapshot(roomRef, (snap) => {
+                        if (snap.exists()) {
+                            const data = snap.data();
+                            if (Array.isArray(data.teachers) && data.teachers.length > 0) {
+                                state.teachers = data.teachers;
+                                if (!state.teachers.includes(state.currentTeacher)) {
+                                    state.currentTeacher = state.teachers[0];
+                                }
+                                saveToLocalStorage();
+                                renderAll();
+                            }
+                        }
+                    });
+
+                    const unsubGames = onSnapshot(collection(roomRef, "games"), (snapshot) => {
+                        const cloudGames = [];
+                        snapshot.forEach((docSnap) => {
+                            cloudGames.push({ id: docSnap.id, ...docSnap.data() });
+                        });
+                        cloudGames.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+                        state.games = cloudGames;
+                        saveToLocalStorage();
+                        renderAll();
+                    });
+
+                    const unsubLessons = onSnapshot(collection(roomRef, "lessons"), (snapshot) => {
+                        const cloudLessons = [];
+                        snapshot.forEach((docSnap) => {
+                            cloudLessons.push({ id: docSnap.id, ...docSnap.data() });
+                        });
+                        cloudLessons.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+                        state.lessons = cloudLessons;
+                        saveToLocalStorage();
+                        renderAll();
+                    });
+
+                    const unsubSnapshots = onSnapshot(collection(roomRef, "snapshots"), (snapshot) => {
+                        const cloudSnaps = [];
+                        snapshot.forEach((docSnap) => {
+                            cloudSnaps.push({ id: docSnap.id, ...docSnap.data() });
+                        });
+                        cloudSnaps.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+                        state.snapshots = cloudSnaps;
+                        saveToLocalStorage();
+                        renderAll();
+                    });
+
+                    state.unsubscribers.push(unsubRoom, unsubGames, unsubLessons, unsubSnapshots);
+                } catch (err) {
+                    console.warn("Firebase 연결 실패, 브라우저 저장 모드로 전환:", err);
+                    state.isCloudConnected = false;
+                    updateConnectionUI();
+                }
+            }
+
+            // 로딩 스피너 숨기고 활성 탭 표시
+            document.getElementById("loading-spinner").classList.add("hidden");
+            switchTab(state.activeTab);
+        }
+
+        // ==========================================
+        // 5. UI 렌더링 함수
+        // ==========================================
+        function renderAll() {
+            renderHeaderTeacherSelect();
+            renderStats();
+            renderOwnerFilterTabs();
+            renderGamesGrid();
+            renderLessonsList();
+            renderSnapshotsList();
+        }
+
+        function renderHeaderTeacherSelect() {
+            const select = document.getElementById("current-teacher-select");
+            const subtitle = document.getElementById("header-subtitle");
+            subtitle.textContent = `${state.teachers.length}인 교사 공동 보유 및 순환 대여 현황판`;
+
+            select.innerHTML = state.teachers
+                .map((t) => `<option value="${escapeHtml(t)}" class="text-slate-900">${escapeHtml(t)}</option>`)
+                .join("");
+            select.value = state.currentTeacher;
+        }
+
+        function renderStats() {
+            const total = state.games.length;
+            const borrowed = state.games.filter((g) => g.status === "borrowed").length;
+            const available = total - borrowed;
+
+            document.getElementById("stat-total-games").textContent = `${total}종`;
+            document.getElementById("stat-available-games").textContent = `${available}종`;
+            document.getElementById("stat-borrowed-games").textContent = `${borrowed}종`;
+            document.getElementById("stat-teacher-count").textContent = `${state.teachers.length}명`;
+            document.getElementById("snapshot-count-badge").textContent = state.snapshots.length;
+        }
+
+        function renderOwnerFilterTabs() {
+            const container = document.getElementById("owner-filter-container");
+            const tabs = ["ALL", ...state.teachers];
+            container.innerHTML = tabs
+                .map((owner) => {
+                    const isAll = owner === "ALL";
+                    const count = isAll
+                        ? state.games.length
+                        : state.games.filter((g) => g.owner === owner).length;
+                    const active = state.ownerFilter === owner;
+                    const cls = active
+                        ? "bg-indigo-600 text-white shadow-xs"
+                        : "bg-slate-100 text-slate-600 hover:bg-slate-200";
+                    return `
+                        <button type="button" data-owner="${escapeHtml(owner)}" class="owner-filter-btn px-3 py-1.5 rounded-xl text-xs font-bold transition ${cls}">
+                            ${isAll ? "전체" : escapeHtml(owner)} (${count})
+                        </button>
+                    `;
+                })
+                .join("");
+
+            container.querySelectorAll(".owner-filter-btn").forEach((btn) => {
+                btn.onclick = () => {
+                    state.ownerFilter = btn.dataset.owner;
+                    renderOwnerFilterTabs();
+                    renderGamesGrid();
+                };
+            });
+        }
+
+        function renderGamesGrid() {
+            const grid = document.getElementById("games-grid");
+            const emptyState = document.getElementById("empty-state");
+            const query = state.searchQuery.trim().toLowerCase();
+
+            const filtered = state.games.filter((g) => {
+                if (state.ownerFilter !== "ALL" && g.owner !== state.ownerFilter) return false;
+                if (state.statusFilter !== "ALL" && g.status !== state.statusFilter) return false;
+                if (query) {
+                    const hay = `${g.name} ${g.owner} ${g.genre} ${g.players} ${g.notes} ${g.borrower || ""}`.toLowerCase();
+                    if (!hay.includes(query)) return false;
+                }
+                return true;
             });
 
-            const cbContainer = document.getElementById('lesson-game-checkboxes');
-            cbContainer.innerHTML = '';
-            const selectedSet = new Set(Array.isArray(lessonToEdit?.gamesUsed) ? lessonToEdit.gamesUsed : []);
-
-            if (allGames.length === 0) {
-                cbContainer.innerHTML = '<span class="text-xs text-slate-400">등록된 보드게임이 없습니다. 아래에 직접 입력해 주세요.</span>';
-            } else {
-                allGames.forEach(g => {
-                    const label = document.createElement('label');
-                    label.className = 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white border border-slate-200 text-xs cursor-pointer';
-                    label.innerHTML = `
-                        <input type="checkbox" class="lesson-game-checkbox rounded text-indigo-600" value="${escapeHtml(g.name)}" ${selectedSet.has(g.name) ? 'checked' : ''} />
-                        <span>${escapeHtml(g.name)}</span>
-                    `;
-                    cbContainer.appendChild(label);
-                });
-            }
-
-            if (lessonToEdit) {
-                document.getElementById('lesson-modal-title').textContent = '수업 계획 / 기록 수정';
-                document.getElementById('edit-lesson-id').value = lessonToEdit.id;
-                document.getElementById('lesson-week-input').value = lessonToEdit.week || '';
-                teacherSelect.value = teachersList.includes(lessonToEdit.teacher) ? lessonToEdit.teacher : teachersList[0];
-                document.getElementById('lesson-status-select').value = lessonToEdit.status || 'planned';
-                document.getElementById('lesson-class-input').value = lessonToEdit.classInfo || '';
-                document.getElementById('lesson-topic-input').value = lessonToEdit.topic || '';
-                document.getElementById('lesson-custom-games-input').value = '';
-                document.getElementById('lesson-notes-input').value = lessonToEdit.notes || '';
-            } else {
-                document.getElementById('lesson-modal-title').textContent = '주차별 수업 계획 / 기록 등록';
-                document.getElementById('edit-lesson-id').value = '';
-                document.getElementById('lesson-week-input').value = '';
-                teacherSelect.value = teachersList.includes(currentTeacher) ? currentTeacher : teachersList[0];
-                document.getElementById('lesson-status-select').value = 'planned';
-                document.getElementById('lesson-class-input').value = '';
-                document.getElementById('lesson-topic-input').value = '';
-                document.getElementById('lesson-custom-games-input').value = '';
-                document.getElementById('lesson-notes-input').value = '';
-            }
-
-            document.getElementById('lesson-modal').classList.remove('hidden');
-        }
-
-        function closeLessonModal() {
-            document.getElementById('lesson-modal').classList.add('hidden');
-        }
-
-        window.openEditLessonModal = (lessonId) => {
-            const target = allLessons.find(l => l.id === lessonId);
-            if (target) openLessonModal(target);
-        };
-
-        document.getElementById('open-add-lesson-btn').addEventListener('click', () => openLessonModal(null));
-        document.getElementById('close-lesson-modal-btn').addEventListener('click', closeLessonModal);
-        document.getElementById('cancel-lesson-modal-btn').addEventListener('click', closeLessonModal);
-
-        document.getElementById('lesson-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const editId = document.getElementById('edit-lesson-id').value;
-            const week = document.getElementById('lesson-week-input').value.trim();
-            const teacher = document.getElementById('lesson-teacher-select').value;
-            const status = document.getElementById('lesson-status-select').value;
-            const classInfo = document.getElementById('lesson-class-input').value.trim();
-            const topic = document.getElementById('lesson-topic-input').value.trim();
-            const notes = document.getElementById('lesson-notes-input').value.trim();
-
-            const checkedGames = Array.from(document.querySelectorAll('.lesson-game-checkbox:checked')).map(cb => cb.value);
-            const customGames = document.getElementById('lesson-custom-games-input').value
-                .split(',')
-                .map(s => s.trim())
-                .filter(Boolean);
-            const gamesUsed = Array.from(new Set([...checkedGames, ...customGames]));
-
-            if (!week || !topic) {
-                showToast("주차와 수업 주제를 입력해 주세요.", "error");
+            if (filtered.length === 0) {
+                grid.innerHTML = "";
+                emptyState.classList.remove("hidden");
                 return;
             }
 
-            const payload = { week, teacher, status, classInfo, topic, gamesUsed, notes, updatedAt: Date.now() };
+            emptyState.classList.add("hidden");
+            grid.innerHTML = filtered
+                .map((game) => {
+                    const isBorrowed = game.status === "borrowed";
+                    const badgeHtml = isBorrowed
+                        ? `<span class="px-2.5 py-1 rounded-full text-xs font-bold bg-amber-100 text-amber-800">대여 중 (${escapeHtml(game.borrower)})</span>`
+                        : `<span class="px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-700">대여 가능</span>`;
 
-            try {
-                if (editId) {
-                    if (ensureDbReady()) {
-                        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'lessons', editId), payload);
-                    } else {
-                        allLessons = allLessons.map(l => l.id === editId ? { ...l, ...payload } : l);
-                        writeLocalBackup(appId, { lessons: allLessons });
-                        renderLessons();
-                    }
-                    showToast("수업 정보가 수정되었습니다.");
-                } else {
-                    const newLesson = { ...payload, createdAt: Date.now() };
-                    if (ensureDbReady()) {
-                        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'lessons'), newLesson);
-                    } else {
-                        allLessons = [{ id: `local_lesson_${Date.now()}`, ...newLesson }, ...allLessons];
-                        writeLocalBackup(appId, { lessons: allLessons });
-                        renderLessons();
-                    }
-                    showToast("수업 기록이 저장되었습니다.");
-                }
-                closeLessonModal();
-            } catch (error) {
-                console.error("수업 저장 오류:", error);
-                showToast("수업 저장 중 오류가 발생했습니다.", "error");
-            }
-        });
+                    const actionBtnHtml = isBorrowed
+                        ? `<button type="button" data-action="toggle-borrow" data-id="${escapeHtml(game.id)}" class="flex-1 py-2 px-3 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold transition">↩ 반납 처리하기</button>`
+                        : `<button type="button" data-action="toggle-borrow" data-id="${escapeHtml(game.id)}" class="flex-1 py-2 px-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold transition">🤝 ${escapeHtml(state.currentTeacher)} 대여하기</button>`;
 
-        // 현재 정보 저장하기 (스냅샷)
-        function openSnapshotSaveModal() {
-            document.getElementById('snapshot-title-input').value = '';
-            document.getElementById('snapshot-memo-input').value = '';
-            document.getElementById('snapshot-save-modal').classList.remove('hidden');
+                    return `
+                        <article class="bg-white rounded-2xl p-5 border ${isBorrowed ? "border-amber-200" : "border-slate-200/80"} shadow-sm hover:shadow-md transition flex flex-col justify-between gap-4">
+                            <div class="space-y-2.5">
+                                <div class="flex items-start justify-between gap-2">
+                                    <div>
+                                        <span class="inline-block text-[11px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-md mb-1">
+                                            보유: ${escapeHtml(game.owner)}
+                                        </span>
+                                        <h3 class="text-base font-bold text-slate-800 leading-snug">${escapeHtml(game.name)}</h3>
+                                    </div>
+                                    ${badgeHtml}
+                                </div>
+
+                                <div class="flex flex-wrap gap-1.5 text-xs text-slate-600">
+                                    ${game.players ? `<span class="px-2 py-0.5 rounded-lg bg-slate-100">👥 ${escapeHtml(game.players)}</span>` : ""}
+                                    ${game.genre ? `<span class="px-2 py-0.5 rounded-lg bg-slate-100">🏷️ ${escapeHtml(game.genre)}</span>` : ""}
+                                </div>
+
+                                ${game.notes ? `<p class="text-xs text-slate-500 bg-slate-50 p-2.5 rounded-xl leading-relaxed">${escapeHtml(game.notes)}</p>` : ""}
+                            </div>
+
+                            <div class="flex items-center gap-2 pt-2 border-t border-slate-100">
+                                ${actionBtnHtml}
+                                <button type="button" data-action="edit-game" data-id="${escapeHtml(game.id)}" class="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 text-xs font-semibold" title="수정">✏️</button>
+                                <button type="button" data-action="delete-game" data-id="${escapeHtml(game.id)}" class="p-2 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-600 text-xs font-semibold" title="삭제">🗑️</button>
+                            </div>
+                        </article>
+                    `;
+                })
+                .join("");
+
+            grid.querySelectorAll("button[data-action]").forEach((btn) => {
+                btn.onclick = async () => {
+                    const id = btn.dataset.id;
+                    const action = btn.dataset.action;
+                    if (action === "toggle-borrow") {
+                        await toggleBorrowGame(id);
+                    } else if (action === "edit-game") {
+                        openGameModal(id);
+                    } else if (action === "delete-game") {
+                        const target = state.games.find((g) => g.id === id);
+                        const ok = await openConfirmModal("보드게임 삭제", `'${target?.name || ""}' 보드게임을 목록에서 삭제하시겠습니까?`);
+                        if (ok) await removeGame(id);
+                    }
+                };
+            });
         }
 
-        function closeSnapshotSaveModal() {
-            document.getElementById('snapshot-save-modal').classList.add('hidden');
-        }
+        function renderLessonsList() {
+            const container = document.getElementById("lessons-container");
+            const emptyState = document.getElementById("lessons-empty-state");
 
-        document.getElementById('open-snapshot-modal-btn').addEventListener('click', openSnapshotSaveModal);
-        document.getElementById('quick-save-snapshot-btn').addEventListener('click', openSnapshotSaveModal);
-        document.getElementById('snapshots-view-save-btn').addEventListener('click', openSnapshotSaveModal);
-        document.getElementById('close-snapshot-save-btn').addEventListener('click', closeSnapshotSaveModal);
-        document.getElementById('cancel-snapshot-save-btn').addEventListener('click', closeSnapshotSaveModal);
+            const filtered = state.lessons.filter((l) => {
+                if (state.lessonFilter !== "ALL" && l.status !== state.lessonFilter) return false;
+                return true;
+            });
 
-        document.getElementById('snapshot-save-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const titleInput = document.getElementById('snapshot-title-input').value.trim();
-            const memoInput = document.getElementById('snapshot-memo-input').value.trim();
-            const now = new Date();
-            const defaultTitle = `${now.getMonth() + 1}월 ${now.getDate()}일 ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')} 현황 기록`;
-
-            const snapshotPayload = {
-                title: titleInput || defaultTitle,
-                memo: memoInput,
-                savedBy: currentTeacher,
-                createdAt: Date.now(),
-                createdAtText: now.toLocaleString('ko-KR'),
-                teachers: [...teachersList],
-                games: allGames.map(g => ({ ...g })),
-                lessons: allLessons.map(l => ({ ...l }))
-            };
-
-            try {
-                if (ensureDbReady()) {
-                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'snapshots'), snapshotPayload);
-                } else {
-                    allSnapshots = [{ id: `local_snap_${Date.now()}`, ...snapshotPayload }, ...allSnapshots];
-                    writeLocalBackup(appId, { snapshots: allSnapshots });
-                    const badge = document.getElementById('snapshot-count-badge');
-                    if (badge) badge.textContent = allSnapshots.length;
-                    renderSnapshots();
-                }
-                closeSnapshotSaveModal();
-                showToast("현재 정보가 기록으로 저장되었습니다.");
-            } catch (error) {
-                console.error("스냅샷 저장 오류:", error);
-                showToast("기록 저장 중 오류가 발생했습니다.", "error");
-            }
-        });
-
-        // 스냅샷 상세보기 & 복사
-        window.openSnapshotDetail = (snapId) => {
-            const snap = allSnapshots.find(s => s.id === snapId);
-            if (!snap) return;
-            activeSnapshotForCopy = snap;
-
-            document.getElementById('snapshot-detail-title').textContent = snap.title;
-            document.getElementById('snapshot-detail-meta').textContent = `${snap.createdAtText || ''} · 저장자: ${snap.savedBy || ''}`;
-
-            const teachersHtml = (snap.teachers || []).map(t => `<span class="px-2.5 py-1 rounded-lg bg-indigo-50 text-indigo-700 text-xs font-semibold">${escapeHtml(t)}</span>`).join('');
-            const gamesHtml = (snap.games || []).length > 0
-                ? (snap.games || []).map(g => `<li class="text-xs text-slate-700">• <strong>${escapeHtml(g.name)}</strong> (${escapeHtml(g.owner)}) - ${g.status === 'borrowed' ? `${escapeHtml(g.borrower)} 대여 중` : '대여 가능'}</li>`).join('')
-                : '<li class="text-xs text-slate-400">등록된 게임 없음</li>';
-            const lessonsHtml = (snap.lessons || []).length > 0
-                ? (snap.lessons || []).map(l => `<li class="text-xs text-slate-700">• [${escapeHtml(l.week)}] ${escapeHtml(l.teacher)} - ${escapeHtml(l.topic)} (${l.status === 'completed' ? '완료' : '예정'})</li>`).join('')
-                : '<li class="text-xs text-slate-400">등록된 수업 기록 없음</li>';
-
-            document.getElementById('snapshot-detail-body').innerHTML = `
-                ${snap.memo ? `<div class="p-3 rounded-xl bg-amber-50 text-amber-900 text-xs">${escapeHtml(snap.memo)}</div>` : ''}
-                <div>
-                    <h4 class="text-xs font-bold text-slate-500 mb-1.5">선생님 명단 (${(snap.teachers || []).length}명)</h4>
-                    <div class="flex flex-wrap gap-1.5">${teachersHtml}</div>
-                </div>
-                <div>
-                    <h4 class="text-xs font-bold text-slate-500 mb-1.5">보유 게임 현황 (${(snap.games || []).length}종)</h4>
-                    <ul class="space-y-1 bg-slate-50 p-3 rounded-xl">${gamesHtml}</ul>
-                </div>
-                <div>
-                    <h4 class="text-xs font-bold text-slate-500 mb-1.5">주차별 수업 기록 (${(snap.lessons || []).length}건)</h4>
-                    <ul class="space-y-1 bg-slate-50 p-3 rounded-xl">${lessonsHtml}</ul>
-                </div>
-            `;
-            document.getElementById('snapshot-detail-modal').classList.remove('hidden');
-        };
-
-        function closeSnapshotDetail() {
-            document.getElementById('snapshot-detail-modal').classList.add('hidden');
-        }
-
-        document.getElementById('close-snapshot-detail-btn').addEventListener('click', closeSnapshotDetail);
-        document.getElementById('close-snapshot-detail-footer-btn').addEventListener('click', closeSnapshotDetail);
-
-        document.getElementById('copy-snapshot-text-btn').addEventListener('click', () => {
-            if (!activeSnapshotForCopy) return;
-            const s = activeSnapshotForCopy;
-            const lines = [
-                `[늘봄 보드게임 현황 기록: ${s.title}]`,
-                `일시: ${s.createdAtText || ''} (작성: ${s.savedBy || ''})`,
-                s.memo ? `메모: ${s.memo}` : '',
-                `선생님(${(s.teachers || []).length}명): ${(s.teachers || []).join(', ')}`,
-                `\n[보유 게임 ${(s.games || []).length}종]`,
-                ...(s.games || []).map(g => `- ${g.name} (보유: ${g.owner}, 상태: ${g.status === 'borrowed' ? `${g.borrower} 대여중` : '대여가능'})`),
-                `\n[수업 기록 ${(s.lessons || []).length}건]`,
-                ...(s.lessons || []).map(l => `- [${l.week}] ${l.teacher}: ${l.topic} (${l.status === 'completed' ? '완료' : '예정'})`)
-            ].filter(Boolean).join('\n');
-
-            const tempTextarea = document.createElement('textarea');
-            tempTextarea.value = lines;
-            document.body.appendChild(tempTextarea);
-            tempTextarea.select();
-            document.execCommand('copy');
-            document.body.removeChild(tempTextarea);
-            showToast("공유용 텍스트가 클립보드에 복사되었습니다.");
-        });
-
-        // 공유 연결 설정 모달
-        function openDbConfigModal() {
-            document.getElementById('db-group-input').value = appId;
-            const ls = getLocalStorageSafe();
-            let savedConfigText = '';
-            if (ls) {
-                try {
-                    savedConfigText = ls.getItem(STORAGE_KEY_CONFIG) || '';
-                } catch (e) {}
-            }
-            document.getElementById('db-json-input').value = savedConfigText;
-            document.getElementById('db-config-modal').classList.remove('hidden');
-        }
-
-        function closeDbConfigModal() {
-            document.getElementById('db-config-modal').classList.add('hidden');
-        }
-
-        document.getElementById('open-db-config-btn').addEventListener('click', openDbConfigModal);
-        document.getElementById('banner-open-db-btn').addEventListener('click', openDbConfigModal);
-        document.getElementById('close-db-config-btn').addEventListener('click', closeDbConfigModal);
-        document.getElementById('cancel-db-config-btn').addEventListener('click', closeDbConfigModal);
-
-        document.getElementById('db-config-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const groupVal = document.getElementById('db-group-input').value.trim() || 'neulbom-boardgame-share';
-            const jsonVal = document.getElementById('db-json-input').value.trim();
-            const ls = getLocalStorageSafe();
-
-            if (jsonVal) {
-                try {
-                    JSON.parse(jsonVal);
-                } catch (err) {
-                    showToast("Firebase Config JSON 형식이 올바르지 않습니다.", "error");
-                    return;
-                }
+            if (filtered.length === 0) {
+                container.innerHTML = "";
+                emptyState.classList.remove("hidden");
+                return;
             }
 
-            if (ls) {
-                try {
-                    ls.setItem(STORAGE_KEY_GROUP, groupVal);
-                    if (jsonVal) {
-                        ls.setItem(STORAGE_KEY_CONFIG, jsonVal);
-                    } else {
-                        ls.removeItem(STORAGE_KEY_CONFIG);
+            emptyState.classList.add("hidden");
+            container.innerHTML = filtered
+                .map((lesson) => {
+                    const isCompleted = lesson.status === "completed";
+                    const gamesList = Array.isArray(lesson.games) ? lesson.games : [];
+                    return `
+                        <article class="bg-white rounded-2xl p-5 border border-slate-200/80 shadow-sm flex flex-col justify-between gap-3">
+                            <div class="space-y-2.5">
+                                <div class="flex items-center justify-between gap-2 flex-wrap">
+                                    <div class="flex items-center gap-2">
+                                        <span class="px-2.5 py-1 rounded-lg bg-indigo-50 text-indigo-700 text-xs font-bold">${escapeHtml(lesson.week)}</span>
+                                        <span class="text-xs font-bold text-slate-700">${escapeHtml(lesson.teacher)}</span>
+                                        ${lesson.classInfo ? `<span class="text-xs text-slate-400">· ${escapeHtml(lesson.classInfo)}</span>` : ""}
+                                    </div>
+                                    <span class="px-2.5 py-0.5 rounded-full text-xs font-bold ${isCompleted ? "bg-emerald-100 text-emerald-700" : "bg-sky-100 text-sky-700"}">
+                                        ${isCompleted ? "✅ 완료 기록" : "🗓️ 예정 수업"}
+                                    </span>
+                                </div>
+
+                                <h3 class="text-base font-bold text-slate-800">${escapeHtml(lesson.topic)}</h3>
+
+                                ${gamesList.length > 0 ? `
+                                    <div class="flex flex-wrap gap-1.5">
+                                        ${gamesList.map((gn) => `<span class="px-2.5 py-1 rounded-lg bg-amber-50 border border-amber-200/70 text-amber-900 text-xs font-semibold">🎲 ${escapeHtml(gn)}</span>`).join("")}
+                                    </div>
+                                ` : ""}
+
+                                ${lesson.notes ? `<p class="text-xs text-slate-600 bg-slate-50 p-3 rounded-xl leading-relaxed">${escapeHtml(lesson.notes)}</p>` : ""}
+                            </div>
+
+                            <div class="flex items-center justify-between pt-2 border-t border-slate-100">
+                                <span class="text-[11px] text-slate-400">등록: ${formatDateTime(lesson.createdAt)}</span>
+                                <div class="flex items-center gap-1.5">
+                                    <button type="button" data-action="edit-lesson" data-id="${escapeHtml(lesson.id)}" class="px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold">수정</button>
+                                    <button type="button" data-action="delete-lesson" data-id="${escapeHtml(lesson.id)}" class="px-2.5 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 text-xs font-semibold">삭제</button>
+                                </div>
+                            </div>
+                        </article>
+                    `;
+                })
+                .join("");
+
+            container.querySelectorAll("button[data-action]").forEach((btn) => {
+                btn.onclick = async () => {
+                    const id = btn.dataset.id;
+                    if (btn.dataset.action === "edit-lesson") {
+                        openLessonModal(id);
+                    } else if (btn.dataset.action === "delete-lesson") {
+                        const ok = await openConfirmModal("수업 기록 삭제", "이 주차별 수업 기록을 삭제하시겠습니까?");
+                        if (ok) await removeLesson(id);
                     }
-                } catch (err) {}
-            }
-
-            closeDbConfigModal();
-            await initApp();
-            showToast("공유 연결 설정이 적용되었습니다.");
-        });
-
-        document.getElementById('reset-db-config-btn').addEventListener('click', async () => {
-            const ls = getLocalStorageSafe();
-            if (ls) {
-                try {
-                    ls.removeItem(STORAGE_KEY_CONFIG);
-                    ls.removeItem(STORAGE_KEY_GROUP);
-                } catch (err) {}
-            }
-            closeDbConfigModal();
-            await initApp();
-            showToast("연결 설정이 초기화되었습니다.");
-        });
-
-        // 삭제 확인 모달
-        function openConfirmModal(type, id, label) {
-            deleteTargetType = type;
-            deleteTargetId = id;
-            document.getElementById('confirm-title').textContent = '삭제 확인';
-            document.getElementById('confirm-message').textContent = `'${label}' 항목을 삭제하시겠습니까?`;
-            document.getElementById('confirm-modal').classList.remove('hidden');
+                };
+            });
         }
 
-        function closeConfirmModal() {
-            deleteTargetType = null;
-            deleteTargetId = null;
-            document.getElementById('confirm-modal').classList.add('hidden');
+        function renderSnapshotsList() {
+            const container = document.getElementById("snapshots-container");
+            const emptyState = document.getElementById("snapshots-empty-state");
+
+            if (state.snapshots.length === 0) {
+                container.innerHTML = "";
+                emptyState.classList.remove("hidden");
+                return;
+            }
+
+            emptyState.classList.add("hidden");
+            container.innerHTML = state.snapshots
+                .map((snap) => {
+                    const gameCount = Array.isArray(snap.games) ? snap.games.length : 0;
+                    const lessonCount = Array.isArray(snap.lessons) ? snap.lessons.length : 0;
+                    const teacherCount = Array.isArray(snap.teachers) ? snap.teachers.length : 0;
+                    return `
+                        <article class="bg-white rounded-2xl p-5 border border-slate-200/80 shadow-sm flex flex-col justify-between gap-3">
+                            <div class="space-y-2">
+                                <div class="flex items-center justify-between gap-2">
+                                    <span class="text-xs font-semibold text-emerald-700 bg-emerald-50 px-2.5 py-0.5 rounded-full">
+                                        저장일시: ${formatDateTime(snap.createdAt)}
+                                    </span>
+                                    <span class="text-xs text-slate-500">작성: ${escapeHtml(snap.savedBy || "-")}</span>
+                                </div>
+                                <h3 class="text-base font-bold text-slate-800">${escapeHtml(snap.title)}</h3>
+                                ${snap.memo ? `<p class="text-xs text-slate-600">${escapeHtml(snap.memo)}</p>` : ""}
+                                <div class="flex flex-wrap gap-2 pt-1 text-xs font-semibold text-slate-600">
+                                    <span class="px-2.5 py-1 rounded-lg bg-slate-100">선생님 ${teacherCount}명</span>
+                                    <span class="px-2.5 py-1 rounded-lg bg-slate-100">보드게임 ${gameCount}종</span>
+                                    <span class="px-2.5 py-1 rounded-lg bg-slate-100">수업기록 ${lessonCount}건</span>
+                                </div>
+                            </div>
+                            <div class="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+                                <button type="button" data-action="view-snap" data-id="${escapeHtml(snap.id)}" class="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold">상세보기 &amp; 복사</button>
+                                <button type="button" data-action="delete-snap" data-id="${escapeHtml(snap.id)}" class="px-3 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-600 text-xs font-semibold">삭제</button>
+                            </div>
+                        </article>
+                    `;
+                })
+                .join("");
+
+            container.querySelectorAll("button[data-action]").forEach((btn) => {
+                btn.onclick = async () => {
+                    const id = btn.dataset.id;
+                    if (btn.dataset.action === "view-snap") {
+                        openSnapshotDetailModal(id);
+                    } else if (btn.dataset.action === "delete-snap") {
+                        const ok = await openConfirmModal("저장 기록 삭제", "선택한 스냅샷 기록을 삭제하시겠습니까?");
+                        if (ok) await removeSnapshot(id);
+                    }
+                };
+            });
         }
-
-        window.promptDeleteGame = (id, name) => openConfirmModal('game', id, name);
-        window.promptDeleteLesson = (id, topic) => openConfirmModal('lesson', id, topic);
-        window.promptDeleteSnapshot = (id, title) => openConfirmModal('snapshot', id, title);
-
-        document.getElementById('confirm-cancel-btn').addEventListener('click', closeConfirmModal);
-        document.getElementById('confirm-ok-btn').addEventListener('click', async () => {
-            if (!deleteTargetId) return;
-            try {
-                if (deleteTargetType === 'game') {
-                    if (ensureDbReady()) {
-                        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'boardgames', deleteTargetId));
-                    } else {
-                        allGames = allGames.filter(g => g.id !== deleteTargetId);
-                        writeLocalBackup(appId, { games: allGames });
-                        updateDashboardStats();
-                        renderGames();
-                    }
-                    showToast("보드게임이 삭제되었습니다.");
-                } else if (deleteTargetType === 'lesson') {
-                    if (ensureDbReady()) {
-                        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'lessons', deleteTargetId));
-                    } else {
-                        allLessons = allLessons.filter(l => l.id !== deleteTargetId);
-                        writeLocalBackup(appId, { lessons: allLessons });
-                        renderLessons();
-                    }
-                    showToast("수업 기록이 삭제되었습니다.");
-                } else if (deleteTargetType === 'snapshot') {
-                    if (ensureDbReady()) {
-                        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'snapshots', deleteTargetId));
-                    } else {
-                        allSnapshots = allSnapshots.filter(s => s.id !== deleteTargetId);
-                        writeLocalBackup(appId, { snapshots: allSnapshots });
-                        const badge = document.getElementById('snapshot-count-badge');
-                        if (badge) badge.textContent = allSnapshots.length;
-                        renderSnapshots();
-                    }
-                    showToast("저장된 기록이 삭제되었습니다.");
-                }
-            } catch (error) {
-                console.error("삭제 오류:", error);
-                showToast("삭제 중 오류가 발생했습니다.", "error");
-            } finally {
-                closeConfirmModal();
-            }
-        });
-
-        // 샘플 5종 추가
-        document.getElementById('load-sample-btn').addEventListener('click', async () => {
-            const samples = [
-                { name: "할리갈리 (HALI GALI)", owner: teachersList[0] || "김선생님", genre: "순발력/순간반응", players: "2~6인", notes: "종 상태 양호, 카드 56장 완비" },
-                { name: "루미큐브 클래식", owner: teachersList[1] || "이선생님", genre: "전략/숫자조합", players: "2~4인", notes: "타일 106개, 받침대 4개 확인 완료" },
-                { name: "스플렌더 (SPLENDOR)", owner: teachersList[2] || "박선생님", genre: "엔진빌딩/자원관리", players: "2~4인", notes: "보석 토큰 40개, 귀족 타일 10장" },
-                { name: "우봉고 3D", owner: teachersList[3] || "최선생님", genre: "공간지각/퍼즐", players: "1~4인", notes: "3D 블록 세트 4인분 구비" },
-                { name: "코드네임 (CODENAMES)", owner: teachersList[4] || "정선생님", genre: "단어연상/팀전", players: "4~8인", notes: "초등 저학년·고학년 어휘 활용 가능" }
-            ];
-
-            try {
-                const cloudReady = ensureDbReady();
-                const createdItems = [];
-                for (let i = 0; i < samples.length; i++) {
-                    const item = {
-                        ...samples[i],
-                        status: 'available',
-                        borrower: null,
-                        borrowedAt: null,
-                        createdAt: Date.now() + i,
-                        updatedAt: Date.now() + i
-                    };
-                    if (cloudReady) {
-                        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'boardgames'), item);
-                    } else {
-                        createdItems.push({ id: `local_sample_${Date.now()}_${i}`, ...item });
-                    }
-                }
-                if (!cloudReady) {
-                    allGames = [...createdItems, ...allGames];
-                    writeLocalBackup(appId, { games: allGames });
-                    updateDashboardStats();
-                    renderGames();
-                }
-                showToast("샘플 보드게임 5종이 등록되었습니다.");
-            } catch (error) {
-                console.error("샘플 추가 오류:", error);
-                showToast("샘플 추가 중 오류가 발생했습니다.", "error");
-            }
-        });
 
         // ==========================================
-        // 7. 탭 전환 및 필터 이벤트 리스너
+        // 6. 탭 전환 및 모달 제어
         // ==========================================
         function switchTab(tabName) {
-            activeTab = tabName;
-            document.getElementById('view-inventory').classList.toggle('hidden', tabName !== 'inventory');
-            document.getElementById('view-schedule').classList.toggle('hidden', tabName !== 'schedule');
-            document.getElementById('view-snapshots').classList.toggle('hidden', tabName !== 'snapshots');
-
+            state.activeTab = tabName;
+            const views = {
+                inventory: document.getElementById("view-inventory"),
+                schedule: document.getElementById("view-schedule"),
+                snapshots: document.getElementById("view-snapshots")
+            };
             const tabs = {
-                inventory: document.getElementById('tab-inventory'),
-                schedule: document.getElementById('tab-schedule'),
-                snapshots: document.getElementById('tab-snapshots')
+                inventory: document.getElementById("tab-inventory"),
+                schedule: document.getElementById("tab-schedule"),
+                snapshots: document.getElementById("tab-snapshots")
             };
 
-            Object.entries(tabs).forEach(([key, el]) => {
+            Object.keys(views).forEach((key) => {
                 if (key === tabName) {
-                    el.className = 'nav-tab px-4 py-2 rounded-xl text-xs sm:text-sm font-bold bg-white text-indigo-700 shadow-sm transition whitespace-nowrap flex items-center gap-1.5';
+                    views[key].classList.remove("hidden");
+                    tabs[key].className = "nav-tab px-4 py-2 rounded-xl text-xs sm:text-sm font-bold bg-white text-indigo-700 shadow-sm transition whitespace-nowrap";
                 } else {
-                    el.className = 'nav-tab px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold text-indigo-100 hover:bg-white/10 transition whitespace-nowrap flex items-center gap-1.5';
+                    views[key].classList.add("hidden");
+                    tabs[key].className = "nav-tab px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold text-indigo-100 hover:bg-white/10 transition whitespace-nowrap";
                 }
             });
         }
 
-        document.getElementById('tab-inventory').addEventListener('click', () => switchTab('inventory'));
-        document.getElementById('tab-schedule').addEventListener('click', () => switchTab('schedule'));
-        document.getElementById('tab-snapshots').addEventListener('click', () => switchTab('snapshots'));
+        // 모달 1: 보드게임 등록/수정
+        function openGameModal(editId = null) {
+            const modal = document.getElementById("game-modal");
+            const titleEl = document.getElementById("game-modal-title");
+            const ownerSelect = document.getElementById("game-owner-input");
 
-        currentTeacherSelect.addEventListener('change', (e) => {
-            currentTeacher = e.target.value;
-            renderGames();
-        });
+            ownerSelect.innerHTML = state.teachers
+                .map((t) => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`)
+                .join("");
 
-        statusFilterSelect.addEventListener('change', (e) => {
-            selectedStatusFilter = e.target.value;
-            renderGames();
-        });
+            if (editId) {
+                const game = state.games.find((g) => g.id === editId);
+                if (!game) return;
+                titleEl.textContent = "보드게임 정보 수정";
+                document.getElementById("edit-game-id").value = game.id;
+                document.getElementById("game-name-input").value = game.name || "";
+                ownerSelect.value = state.teachers.includes(game.owner) ? game.owner : state.teachers[0];
+                document.getElementById("game-players-input").value = game.players || "";
+                document.getElementById("game-genre-input").value = game.genre || "";
+                document.getElementById("game-notes-input").value = game.notes || "";
+            } else {
+                titleEl.textContent = "새 보드게임 등록";
+                document.getElementById("edit-game-id").value = "";
+                document.getElementById("game-name-input").value = "";
+                ownerSelect.value = state.currentTeacher;
+                document.getElementById("game-players-input").value = "";
+                document.getElementById("game-genre-input").value = "";
+                document.getElementById("game-notes-input").value = "";
+            }
 
-        searchInput.addEventListener('input', (e) => {
-            searchQuery = e.target.value;
-            renderGames();
-        });
+            modal.classList.remove("hidden");
+        }
 
-        document.getElementById('lesson-filter-select').addEventListener('change', (e) => {
-            selectedLessonFilter = e.target.value;
-            renderLessons();
-        });
+        // 모달 2: 선생님 이름 설정/추가 및 보유 게임 일괄 등록
+        function openTeachersModal() {
+            const modal = document.getElementById("teachers-modal");
+            const listContainer = document.getElementById("teachers-inputs-list");
+            const bulkOwnerSelect = document.getElementById("teacher-bulk-owner-select");
 
-        window.addEventListener('DOMContentLoaded', initApp);
+            function renderTeacherRows(names) {
+                listContainer.innerHTML = names
+                    .map((name, idx) => `
+                        <div class="flex items-center gap-2 teacher-row">
+                            <span class="w-7 text-xs font-bold text-slate-400 text-center">${idx + 1}</span>
+                            <input type="text" value="${escapeHtml(name)}" placeholder="선생님 성함 입력" class="teacher-name-input flex-1 px-3.5 py-2 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                            ${names.length > 1 ? `<button type="button" data-idx="${idx}" class="remove-teacher-row-btn px-2.5 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-600 text-xs font-bold">삭제</button>` : ""}
+                        </div>
+                    `)
+                    .join("");
+
+                listContainer.querySelectorAll(".remove-teacher-row-btn").forEach((btn) => {
+                    btn.onclick = () => {
+                        const currentInputs = Array.from(listContainer.querySelectorAll(".teacher-name-input")).map((i) => i.value);
+                        currentInputs.splice(Number(btn.dataset.idx), 1);
+                        renderTeacherRows(currentInputs);
+                        syncBulkOwnerOptions(currentInputs);
+                    };
+                });
+
+                listContainer.querySelectorAll(".teacher-name-input").forEach((inp) => {
+                    inp.oninput = () => {
+                        const currentInputs = Array.from(listContainer.querySelectorAll(".teacher-name-input")).map((i) => i.value.trim()).filter(Boolean);
+                        syncBulkOwnerOptions(currentInputs);
+                    };
+                });
+            }
+
+            function syncBulkOwnerOptions(names) {
+                const validNames = names.filter((n) => n.trim().length > 0);
+                const prev = bulkOwnerSelect.value;
+                bulkOwnerSelect.innerHTML = validNames
+                    .map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`)
+                    .join("");
+                if (validNames.includes(prev)) {
+                    bulkOwnerSelect.value = prev;
+                } else if (validNames.includes(state.currentTeacher)) {
+                    bulkOwnerSelect.value = state.currentTeacher;
+                }
+            }
+
+            renderTeacherRows([...state.teachers]);
+            syncBulkOwnerOptions([...state.teachers]);
+            document.getElementById("teacher-bulk-games-input").value = "";
+
+            document.getElementById("add-teacher-row-btn").onclick = () => {
+                const currentInputs = Array.from(listContainer.querySelectorAll(".teacher-name-input")).map((i) => i.value);
+                currentInputs.push(`새 선생님 ${currentInputs.length + 1}`);
+                renderTeacherRows(currentInputs);
+                syncBulkOwnerOptions(currentInputs);
+            };
+
+            modal.classList.remove("hidden");
+        }
+
+        // 모달 3: 주차별 수업 계획/기록
+        function openLessonModal(editId = null) {
+            const modal = document.getElementById("lesson-modal");
+            const titleEl = document.getElementById("lesson-modal-title");
+            const teacherSelect = document.getElementById("lesson-teacher-select");
+            const checkboxesBox = document.getElementById("lesson-game-checkboxes");
+
+            teacherSelect.innerHTML = state.teachers
+                .map((t) => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`)
+                .join("");
+
+            const uniqueGameNames = [...new Set(state.games.map((g) => g.name))];
+            if (uniqueGameNames.length === 0) {
+                checkboxesBox.innerHTML = `<p class="text-xs text-slate-400">등록된 보유 게임이 없습니다. 아래에 직접 게임 이름을 입력해 주세요.</p>`;
+            } else {
+                checkboxesBox.innerHTML = uniqueGameNames
+                    .map((gName) => `
+                        <label class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white border border-slate-200 text-xs font-medium cursor-pointer hover:border-indigo-400">
+                            <input type="checkbox" value="${escapeHtml(gName)}" class="lesson-game-cb rounded text-indigo-600" />
+                            <span>${escapeHtml(gName)}</span>
+                        </label>
+                    `)
+                    .join("");
+            }
+
+            if (editId) {
+                const lesson = state.lessons.find((l) => l.id === editId);
+                if (!lesson) return;
+                titleEl.textContent = "주차별 수업 계획 / 기록 수정";
+                document.getElementById("edit-lesson-id").value = lesson.id;
+                document.getElementById("lesson-week-input").value = lesson.week || "";
+                teacherSelect.value = state.teachers.includes(lesson.teacher) ? lesson.teacher : state.teachers[0];
+                document.getElementById("lesson-status-select").value = lesson.status || "planned";
+                document.getElementById("lesson-class-input").value = lesson.classInfo || "";
+                document.getElementById("lesson-topic-input").value = lesson.topic || "";
+                document.getElementById("lesson-notes-input").value = lesson.notes || "";
+
+                const selectedGames = Array.isArray(lesson.games) ? lesson.games : [];
+                const extraGames = [];
+                checkboxesBox.querySelectorAll(".lesson-game-cb").forEach((cb) => {
+                    if (selectedGames.includes(cb.value)) cb.checked = true;
+                });
+                selectedGames.forEach((gn) => {
+                    if (!uniqueGameNames.includes(gn)) extraGames.push(gn);
+                });
+                document.getElementById("lesson-custom-games-input").value = extraGames.join(", ");
+            } else {
+                titleEl.textContent = "주차별 수업 계획 / 기록 등록";
+                document.getElementById("edit-lesson-id").value = "";
+                document.getElementById("lesson-week-input").value = "";
+                teacherSelect.value = state.currentTeacher;
+                document.getElementById("lesson-status-select").value = "planned";
+                document.getElementById("lesson-class-input").value = "";
+                document.getElementById("lesson-topic-input").value = "";
+                document.getElementById("lesson-custom-games-input").value = "";
+                document.getElementById("lesson-notes-input").value = "";
+            }
+
+            modal.classList.remove("hidden");
+        }
+
+        // 모달 4: 현재 정보 저장하기
+        function openSnapshotSaveModal() {
+            const modal = document.getElementById("snapshot-save-modal");
+            const now = new Date();
+            const defaultTitle = `${now.getMonth() + 1}월 ${now.getDate()}일 늘봄 보드게임 현황 기록`;
+            document.getElementById("snapshot-title-input").value = defaultTitle;
+            document.getElementById("snapshot-memo-input").value = "";
+            modal.classList.remove("hidden");
+        }
+
+        // 모달 5: 저장된 스냅샷 상세보기
+        function openSnapshotDetailModal(snapshotId) {
+            const snap = state.snapshots.find((s) => s.id === snapshotId);
+            if (!snap) return;
+            state.currentDetailSnapshot = snap;
+
+            document.getElementById("snapshot-detail-title").textContent = snap.title;
+            document.getElementById("snapshot-detail-meta").textContent = `저장일시: ${formatDateTime(snap.createdAt)} · 저장 교사: ${snap.savedBy || "-"}`;
+
+            const body = document.getElementById("snapshot-detail-body");
+            const teachersText = (snap.teachers || []).join(", ");
+            const gamesHtml = (snap.games || []).length > 0
+                ? snap.games.map((g) => `<li class="py-1 border-b border-slate-100 flex justify-between"><span><strong>${escapeHtml(g.name)}</strong> (${escapeHtml(g.owner)})</span><span class="text-xs ${g.status === "borrowed" ? "text-amber-600 font-bold" : "text-emerald-600"}">${g.status === "borrowed" ? `대여중(${escapeHtml(g.borrower)})` : "대여가능"}</span></li>`).join("")
+                : `<li class="text-slate-400">등록된 게임 없음</li>`;
+
+            const lessonsHtml = (snap.lessons || []).length > 0
+                ? snap.lessons.map((l) => `<li class="py-1 border-b border-slate-100"><strong>[${escapeHtml(l.week)}]</strong> ${escapeHtml(l.teacher)} - ${escapeHtml(l.topic)}</li>`).join("")
+                : `<li class="text-slate-400">등록된 수업 기록 없음</li>`;
+
+            body.innerHTML = `
+                ${snap.memo ? `<div class="p-3 rounded-xl bg-amber-50 text-amber-900 text-xs">${escapeHtml(snap.memo)}</div>` : ""}
+                <div>
+                    <h4 class="text-xs font-bold text-slate-500 uppercase mb-1">참여 선생님 (${(snap.teachers || []).length}명)</h4>
+                    <p class="text-sm font-medium text-slate-800 bg-slate-50 p-3 rounded-xl">${escapeHtml(teachersText)}</p>
+                </div>
+                <div>
+                    <h4 class="text-xs font-bold text-slate-500 uppercase mb-1">보유 보드게임 목록 (${(snap.games || []).length}종)</h4>
+                    <ul class="bg-slate-50 p-3 rounded-xl text-xs space-y-1">${gamesHtml}</ul>
+                </div>
+                <div>
+                    <h4 class="text-xs font-bold text-slate-500 uppercase mb-1">주차별 수업 공유 (${(snap.lessons || []).length}건)</h4>
+                    <ul class="bg-slate-50 p-3 rounded-xl text-xs space-y-1">${lessonsHtml}</ul>
+                </div>
+            `;
+
+            document.getElementById("snapshot-detail-modal").classList.remove("hidden");
+        }
+
+        // 모달 6: 공유 연결 설정
+        function openDbConfigModal() {
+            document.getElementById("db-group-input").value = state.groupId;
+            document.getElementById("db-json-input").value = state.firebaseConfig ? JSON.stringify(state.firebaseConfig, null, 2) : "";
+            document.getElementById("db-config-modal").classList.remove("hidden");
+        }
+
+        // ==========================================
+        // 7. 이벤트 리스너 바인딩
+        // ==========================================
+        function bindEvents() {
+            // 상단 탭 전환
+            document.getElementById("tab-inventory").onclick = () => switchTab("inventory");
+            document.getElementById("tab-schedule").onclick = () => switchTab("schedule");
+            document.getElementById("tab-snapshots").onclick = () => switchTab("snapshots");
+
+            // 접속 교사 변경
+            document.getElementById("current-teacher-select").onchange = (e) => {
+                state.currentTeacher = e.target.value;
+                saveToLocalStorage();
+                renderGamesGrid();
+                showToast(`접속 교사가 '${state.currentTeacher}'(으)로 변경되었습니다.`, "info");
+            };
+
+            // 검색 및 필터
+            document.getElementById("search-input").oninput = (e) => {
+                state.searchQuery = e.target.value;
+                renderGamesGrid();
+            };
+
+            document.getElementById("status-filter-select").onchange = (e) => {
+                state.statusFilter = e.target.value;
+                renderGamesGrid();
+            };
+
+            document.getElementById("lesson-filter-select").onchange = (e) => {
+                state.lessonFilter = e.target.value;
+                renderLessonsList();
+            };
+
+            // 샘플 5종 추가 버튼
+            document.getElementById("load-sample-btn").onclick = async () => {
+                const t = state.teachers;
+                const samples = [
+                    { name: "할리갈리", owner: t[0] || "김선생님", players: "2~6인", genre: "순발력/연산", notes: "종 치기 게임, 저학년 집중력 향상에 매우 좋음" },
+                    { name: "루미큐브", owner: t[1 % t.length] || "이선생님", players: "2~4인", genre: "전략/수리논리", notes: "숫자 조합 및 규칙 이해, 3~6학년 추천" },
+                    { name: "스플렌더", owner: t[2 % t.length] || "박선생님", players: "2~4인", genre: "자원관리/전략", notes: "보석 토큰 분실 주의, 고학년 인기 게임" },
+                    { name: "우봉고 3D", owner: t[3 % t.length] || "최선생님", players: "1~4인", genre: "공간지각/퍼즐", notes: "입체 블록 공간 감각 훈련" },
+                    { name: "펭귄파티", owner: t[4 % t.length] || "정선생님", players: "2~6인", genre: "수리/눈치게임", notes: "피라미드 쌓기, 15분 내외 가벼운 도입 활동용" }
+                ];
+
+                for (const item of samples) {
+                    await persistGame(item);
+                }
+                showToast("샘플 보드게임 5종이 등록 및 저장되었습니다!");
+            };
+
+            // 모달 1 (게임 등록/수정)
+            document.getElementById("open-add-game-btn").onclick = () => openGameModal(null);
+            document.getElementById("close-game-modal-btn").onclick = () => document.getElementById("game-modal").classList.add("hidden");
+            document.getElementById("cancel-game-modal-btn").onclick = () => document.getElementById("game-modal").classList.add("hidden");
+
+            document.getElementById("game-form").onsubmit = async (e) => {
+                e.preventDefault();
+                const editId = document.getElementById("edit-game-id").value || null;
+                const name = document.getElementById("game-name-input").value.trim();
+                const owner = document.getElementById("game-owner-input").value;
+                const players = document.getElementById("game-players-input").value.trim();
+                const genre = document.getElementById("game-genre-input").value.trim();
+                const notes = document.getElementById("game-notes-input").value.trim();
+
+                if (!name) return;
+
+                await persistGame({ name, owner, players, genre, notes }, editId);
+                document.getElementById("game-modal").classList.add("hidden");
+                showToast(editId ? `'${name}' 정보가 수정되었습니다.` : `'${name}' 보드게임이 등록 및 저장되었습니다!`);
+            };
+
+            // 모달 2 (선생님 설정 및 일괄 게임 추가)
+            document.getElementById("open-teachers-modal-btn").onclick = openTeachersModal;
+            document.getElementById("close-teachers-modal-btn").onclick = () => document.getElementById("teachers-modal").classList.add("hidden");
+            document.getElementById("cancel-teachers-modal-btn").onclick = () => document.getElementById("teachers-modal").classList.add("hidden");
+
+            document.getElementById("teachers-form").onsubmit = async (e) => {
+                e.preventDefault();
+                const inputs = Array.from(document.querySelectorAll("#teachers-inputs-list .teacher-name-input"));
+                const newTeachers = [...new Set(inputs.map((inp) => inp.value.trim()).filter(Boolean))];
+
+                if (newTeachers.length === 0) {
+                    showToast("최소 1명 이상의 선생님 이름을 입력해 주세요.", "error");
+                    return;
+                }
+
+                // 기존 선생님 이름이 순서대로 바뀐 경우 기존 보유 게임의 owner 이름도 함께 업데이트
+                state.teachers.forEach((oldName, idx) => {
+                    const updatedName = newTeachers[idx];
+                    if (updatedName && oldName !== updatedName) {
+                        state.games.forEach((g) => {
+                            if (g.owner === oldName) g.owner = updatedName;
+                            if (g.borrower === oldName) g.borrower = updatedName;
+                        });
+                    }
+                });
+
+                const nextCurrent = newTeachers.includes(state.currentTeacher) ? state.currentTeacher : newTeachers[0];
+                await persistTeachers(newTeachers, nextCurrent);
+
+                // 일괄 게임 추가 입력값이 있는 경우 함께 등록
+                const bulkOwner = document.getElementById("teacher-bulk-owner-select").value || newTeachers[0];
+                const bulkRaw = document.getElementById("teacher-bulk-games-input").value.trim();
+                let addedCount = 0;
+
+                if (bulkRaw) {
+                    const gameNames = bulkRaw.split(",").map((s) => s.trim()).filter(Boolean);
+                    for (const gName of gameNames) {
+                        await persistGame({
+                            name: gName,
+                            owner: newTeachers.includes(bulkOwner) ? bulkOwner : newTeachers[0],
+                            players: "",
+                            genre: "",
+                            notes: ""
+                        });
+                        addedCount++;
+                    }
+                }
+
+                document.getElementById("teachers-modal").classList.add("hidden");
+                showToast(
+                    addedCount > 0
+                        ? `선생님 명단 및 보유 게임 ${addedCount}종이 저장되었습니다!`
+                        : "선생님 설정이 저장되었습니다!"
+                );
+            };
+
+            // 모달 3 (수업 계획/기록)
+            document.getElementById("open-add-lesson-btn").onclick = () => openLessonModal(null);
+            document.getElementById("close-lesson-modal-btn").onclick = () => document.getElementById("lesson-modal").classList.add("hidden");
+            document.getElementById("cancel-lesson-modal-btn").onclick = () => document.getElementById("lesson-modal").classList.add("hidden");
+
+            document.getElementById("lesson-form").onsubmit = async (e) => {
+                e.preventDefault();
+                const editId = document.getElementById("edit-lesson-id").value || null;
+                const week = document.getElementById("lesson-week-input").value.trim();
+                const teacher = document.getElementById("lesson-teacher-select").value;
+                const status = document.getElementById("lesson-status-select").value;
+                const classInfo = document.getElementById("lesson-class-input").value.trim();
+                const topic = document.getElementById("lesson-topic-input").value.trim();
+                const notes = document.getElementById("lesson-notes-input").value.trim();
+
+                const checkedGames = Array.from(document.querySelectorAll("#lesson-game-checkboxes .lesson-game-cb:checked")).map((cb) => cb.value);
+                const customGames = document.getElementById("lesson-custom-games-input").value
+                    .split(",")
+                    .map((s) => s.trim())
+                    .filter(Boolean);
+
+                const games = [...new Set([...checkedGames, ...customGames])];
+                if (!week || !topic) return;
+
+                await persistLesson({ week, teacher, status, classInfo, topic, games, notes }, editId);
+                document.getElementById("lesson-modal").classList.add("hidden");
+                showToast(editId ? "수업 기록이 수정되었습니다." : "주차별 수업이 저장되었습니다!");
+            };
+
+            // 모달 4 (스냅샷 저장)
+            document.getElementById("open-snapshot-modal-btn").onclick = openSnapshotSaveModal;
+            document.getElementById("quick-save-snapshot-btn").onclick = openSnapshotSaveModal;
+            document.getElementById("snapshots-view-save-btn").onclick = openSnapshotSaveModal;
+            document.getElementById("close-snapshot-save-btn").onclick = () => document.getElementById("snapshot-save-modal").classList.add("hidden");
+            document.getElementById("cancel-snapshot-save-btn").onclick = () => document.getElementById("snapshot-save-modal").classList.add("hidden");
+
+            document.getElementById("snapshot-save-form").onsubmit = async (e) => {
+                e.preventDefault();
+                const title = document.getElementById("snapshot-title-input").value;
+                const memo = document.getElementById("snapshot-memo-input").value;
+                await persistSnapshot(title, memo);
+                document.getElementById("snapshot-save-modal").classList.add("hidden");
+            };
+
+            // 모달 5 (스냅샷 상세보기)
+            document.getElementById("close-snapshot-detail-btn").onclick = () => document.getElementById("snapshot-detail-modal").classList.add("hidden");
+            document.getElementById("close-snapshot-detail-footer-btn").onclick = () => document.getElementById("snapshot-detail-modal").classList.add("hidden");
+
+            document.getElementById("copy-snapshot-text-btn").onclick = async () => {
+                const snap = state.currentDetailSnapshot;
+                if (!snap) return;
+                const lines = [
+                    `[늘봄 보드게임 공유 현황] ${snap.title}`,
+                    `저장일시: ${formatDateTime(snap.createdAt)} (작성: ${snap.savedBy || "-"})`,
+                    snap.memo ? `메모: ${snap.memo}` : "",
+                    "",
+                    `■ 참여 선생님 (${(snap.teachers || []).length}명): ${(snap.teachers || []).join(", ")}`,
+                    "",
+                    `■ 보유 보드게임 (${(snap.games || []).length}종):`,
+                    ...(snap.games || []).map((g) => `- ${g.name} [보유: ${g.owner}] (${g.status === "borrowed" ? `대여중: ${g.borrower}` : "대여가능"})`),
+                    "",
+                    `■ 주차별 수업 기록 (${(snap.lessons || []).length}건):`,
+                    ...(snap.lessons || []).map((l) => `- [${l.week}] ${l.teacher} / ${l.topic} (${(l.games || []).join(", ")})`)
+                ].filter((v) => v !== null);
+
+                try {
+                    await navigator.clipboard.writeText(lines.join("\n"));
+                    showToast("공유용 현황 텍스트가 클립보드에 복사되었습니다!");
+                } catch (_) {
+                    showToast("복사에 실패했습니다. 직접 드래그해 복사해 주세요.", "error");
+                }
+            };
+
+            // 모달 6 (공유 연결 설정)
+            document.getElementById("open-db-config-btn").onclick = openDbConfigModal;
+            document.getElementById("banner-open-db-btn").onclick = openDbConfigModal;
+            document.getElementById("close-db-config-btn").onclick = () => document.getElementById("db-config-modal").classList.add("hidden");
+            document.getElementById("cancel-db-config-btn").onclick = () => document.getElementById("db-config-modal").classList.add("hidden");
+
+            document.getElementById("db-config-form").onsubmit = async (e) => {
+                e.preventDefault();
+                const groupId = document.getElementById("db-group-input").value.trim() || "neulbom-boardgame-share";
+                const rawJson = document.getElementById("db-json-input").value.trim();
+                let parsedConfig = null;
+
+                if (rawJson) {
+                    try {
+                        parsedConfig = JSON.parse(rawJson);
+                    } catch (_) {
+                        showToast("Firebase Config JSON 형식이 올바르지 않습니다.", "error");
+                        return;
+                    }
+                }
+
+                state.groupId = groupId;
+                state.firebaseConfig = parsedConfig;
+                localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify({
+                    groupId: state.groupId,
+                    firebaseConfig: state.firebaseConfig
+                }));
+
+                document.getElementById("db-config-modal").classList.add("hidden");
+                await initStorageAndCloud();
+                showToast("공유 연결 설정이 적용되었습니다!");
+            };
+
+            document.getElementById("reset-db-config-btn").onclick = async () => {
+                localStorage.removeItem(CONFIG_STORAGE_KEY);
+                state.groupId = "neulbom-boardgame-share";
+                state.firebaseConfig = null;
+                document.getElementById("db-config-modal").classList.add("hidden");
+                await initStorageAndCloud();
+                showToast("공유 연결 설정이 초기화되었습니다.", "info");
+            };
+        }
+
+        // ==========================================
+        // 8. 앱 시작
+        // ==========================================
+        bindEvents();
+        initStorageAndCloud();
     </script>
 </body>
 </html>
