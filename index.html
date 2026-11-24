@@ -621,7 +621,8 @@
         // 3. 데이터 CRUD (클라우드 + 로컬 통합 보장)
         // ==========================================
         function getRoomDocRef() {
-            return doc(state.db, "neulbom_boardgame_rooms", state.groupId);
+            const appId = typeof __app_id !== "undefined" ? __app_id : "default-app-id";
+            return doc(state.db, "artifacts", appId, "public", "data", "neulbom_boardgame_rooms", state.groupId);
         }
 
         async function persistTeachers(newTeachers, newCurrentTeacher) {
@@ -910,6 +911,12 @@
 
                     // 실시간 구독 연결
                     const roomRef = getRoomDocRef();
+                    const handleSnapshotError = (err) => {
+                        console.warn("Firestore 실시간 동기화 권한 제한, 브라우저 저장 모드로 전환:", err);
+                        clearUnsubscribers();
+                        state.isCloudConnected = false;
+                        updateConnectionUI();
+                    };
 
                     const unsubRoom = onSnapshot(roomRef, (snap) => {
                         if (snap.exists()) {
@@ -923,7 +930,7 @@
                                 renderAll();
                             }
                         }
-                    });
+                    }, handleSnapshotError);
 
                     const unsubGames = onSnapshot(collection(roomRef, "games"), (snapshot) => {
                         const cloudGames = [];
@@ -934,7 +941,7 @@
                         state.games = cloudGames;
                         saveToLocalStorage();
                         renderAll();
-                    });
+                    }, handleSnapshotError);
 
                     const unsubLessons = onSnapshot(collection(roomRef, "lessons"), (snapshot) => {
                         const cloudLessons = [];
@@ -945,7 +952,7 @@
                         state.lessons = cloudLessons;
                         saveToLocalStorage();
                         renderAll();
-                    });
+                    }, handleSnapshotError);
 
                     const unsubSnapshots = onSnapshot(collection(roomRef, "snapshots"), (snapshot) => {
                         const cloudSnaps = [];
@@ -956,7 +963,7 @@
                         state.snapshots = cloudSnaps;
                         saveToLocalStorage();
                         renderAll();
-                    });
+                    }, handleSnapshotError);
 
                     state.unsubscribers.push(unsubRoom, unsubGames, unsubLessons, unsubSnapshots);
                 } catch (err) {
